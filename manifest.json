@@ -1,0 +1,10 @@
+{
+  "display_name": "斗母猪",
+  "loading_order": 10,
+  "requires": [],
+  "optional": [],
+  "js": "DouSow.js",
+  "author": "HHWWNN",
+  "version": "1.0.0",
+  "homePage": "https://github.com/hhwwnn/DouMZ.git"
+}
