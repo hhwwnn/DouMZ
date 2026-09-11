@@ -1,11 +1,11 @@
-// DouMZ.js - 斗母猪 SillyTavern 扩展（完整版 v8）
+// DouMZ.js - 斗母猪 SillyTavern 扩展（完整版 v9）
 (function () {
     'use strict';
 
     const EXT_NAME = 'DouSow';
-    const STORAGE_KEY = 'dousow_state_v11';
-    const EFFECT_KEY = 'dousow_effects_v11';
-    const UI_KEY = 'dousow_ui_v11';
+    const STORAGE_KEY = 'dousow_state_v12';
+    const EFFECT_KEY = 'dousow_effects_v12';
+    const UI_KEY = 'dousow_ui_v12';
     const PLAYER_NAMES = ['塞拉', '诺亚', '薇拉'];
     const TRIGGER_ORDER = ['3','8','4','5','6','7','10','A','2','J','Q','K','小王','9'];
     const RANK_VALUE = { '3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'10':10,'J':13,'Q':14,'K':15,'A':11,'2':12,'小王':16,'大王':17 };
@@ -14,6 +14,8 @@
     const MAX_PILE = 30;
     const PILE_DISPLAY = 3;
     const PILE_INJECT = 8;
+    const ROUND_SECONDS_IN = 180;
+    const ROUND_SECONDS_OUT = 60;
 
     const DEFAULT_EFFECTS = {
         '3': { name:'3', desc:'乳头与阴蒂敏感和大小增加3倍，男孩玩弄持续一轮。火箭触发时永久，男孩仅+1轮。', duration:1, stackIntensity:true, boy:'男孩玩弄乳头与阴蒂', locked:false },
@@ -62,6 +64,7 @@
             lastMotherIndex: -1,
             consecutiveMother: [0,0,0],
             hasActed: [false, false, false],
+            passCount: 0,
             players: PLAYER_NAMES.map(function (name, idx) {
                 return {
                     name: name, role: '', score: 1000, hand: [], effects: [],
@@ -81,11 +84,8 @@
     function getCtx() {
         try { return window.SillyTavern.getContext(); } catch (e) { return null; }
     }
-
     function invalidateCache() { stateTextCache = null; }
 
-    // ===== 持久化 =====
-    // 关键：actionHistory 不写入存储，避免序列化膨胀
     function serializeForStorage() {
         var copy = {};
         for (var k in G) {
@@ -104,7 +104,7 @@
                 localStorage.setItem(STORAGE_KEY, s);
                 localStorage.setItem(EFFECT_KEY, e);
                 localStorage.setItem(UI_KEY, u);
-            } catch (err) { /* quota 可能超，静默 */ }
+            } catch (err) {}
             var ctx = getCtx();
             if (ctx && ctx.extensionSettings) {
                 if (!ctx.extensionSettings.dousow) ctx.extensionSettings.dousow = {};
@@ -115,8 +115,6 @@
             }
         } catch (err) { console.warn('[DouSow] save error', err); }
     }
-
-    // 关键操作立即保存；其他 debounce
     function saveNow() {
         if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
         saveAll();
@@ -136,7 +134,7 @@
                 if (d.effects) effectsDB = Object.assign({}, DEFAULT_EFFECTS, JSON.parse(d.effects));
                 if (d.ui) uiSettings = Object.assign(uiSettings, JSON.parse(d.ui));
             }
-        } catch (e) { console.warn('[DouSow] ext load error', e); }
+        } catch (e) {}
         if (!loaded) {
             try {
                 var s = localStorage.getItem(STORAGE_KEY);
@@ -145,11 +143,12 @@
                 if (e2) effectsDB = Object.assign({}, DEFAULT_EFFECTS, JSON.parse(e2));
                 var u2 = localStorage.getItem(UI_KEY);
                 if (u2) uiSettings = Object.assign(uiSettings, JSON.parse(u2));
-            } catch (err) { console.warn('[DouSow] ls load error', err); }
+            } catch (err) {}
         }
         if (!G) G = defaultState();
         if (!Array.isArray(G.actionHistory)) G.actionHistory = [];
         if (!Array.isArray(G.hasActed)) G.hasActed = [false, false, false];
+        if (typeof G.passCount !== 'number') G.passCount = 0;
         for (var i = 0; i < G.players.length; i++) {
             var c = G.players[i].clothes;
             if (typeof c === 'string') {
@@ -159,12 +158,10 @@
             }
             if (typeof G.players[i].pendingStrip !== 'number') G.players[i].pendingStrip = 0;
         }
-        // 恢复时裁剪
         if (G.playPile.length > MAX_PILE) G.playPile = G.playPile.slice(-MAX_PILE);
     }
 
     function pushUndo() {
-        // 只保留关键字段的轻量快照
         G.actionHistory.push(JSON.stringify({
             phase: G.phase,
             roundNumber: G.roundNumber,
@@ -174,6 +171,7 @@
             tempMotherIndex: G.tempMotherIndex,
             consecutiveMother: G.consecutiveMother,
             hasActed: G.hasActed,
+            passCount: G.passCount,
             players: G.players.map(function (p) {
                 return {
                     name: p.name, role: p.role, score: p.score, hand: p.hand.slice(),
@@ -260,7 +258,8 @@
         return [playerIdx];
     }
 
-    // ===== 效果 =====
+    // ===== 效果核心 =====
+    // forcePermanent=true 时，主效果永久，男孩部分 +1 轮
     function addEffect(playerIdx, rank, count, forcePermanent) {
         var def = getEffectDef(rank);
         if (!def) return;
@@ -284,14 +283,12 @@
                 for (var is = 0; is < tS.effects.length; is++) {
                     if (tS.effects[is].rank === '小王' && !tS.effects[is].permanent) { existingS = tS.effects[is]; break; }
                 }
-                if (existingS) { existingS.duration += def.duration * count; }
-                else {
-                    tS.effects.push({
-                        rank: '小王', name: '小王', desc: def.desc,
-                        duration: def.duration * count, permanent: false,
-                        stacks: 1, boy: '', boyDuration: 0
-                    });
-                }
+                if (existingS) existingS.duration += def.duration * count;
+                else tS.effects.push({
+                    rank: '小王', name: '小王', desc: def.desc,
+                    duration: def.duration * count, permanent: false,
+                    stacks: 1, boy: '', boyDuration: 0
+                });
             }
             return;
         }
@@ -304,49 +301,53 @@
                 for (var j = 0; j < tP10.effects.length; j++) {
                     if (tP10.effects[j].rank === '10' && !tP10.effects[j].permanent) { ex10 = tP10.effects[j]; break; }
                 }
-                if (ex10) { ex10.remainingCount = (ex10.remainingCount || 0) + count; }
-                else {
-                    tP10.effects.push({
-                        rank: '10', name: '10', desc: def.desc,
-                        duration: 0, permanent: false, stacks: 1,
-                        boy: '', boyDuration: 0,
-                        isInstant: true, remainingCount: count
-                    });
-                }
+                if (ex10) ex10.remainingCount = (ex10.remainingCount || 0) + count;
+                else tP10.effects.push({
+                    rank: '10', name: '10', desc: def.desc,
+                    duration: 0, permanent: false, stacks: 1,
+                    boy: '', boyDuration: 0,
+                    isInstant: true, remainingCount: count
+                });
             }
             return;
         }
 
         var targets = getTargets(playerIdx);
         var isPermanent = !!forcePermanent;
-        var durationValue = isPermanent ? 0 : def.duration * count;
 
         for (var t = 0; t < targets.length; t++) {
             var ti = targets[t];
             var target = G.players[ti];
+            // 匹配同 rank 且同 permanent 状态的效果
             var existingE = null;
             for (var k = 0; k < target.effects.length; k++) {
                 var ee = target.effects[k];
                 if (ee.rank === rank && ee.permanent === isPermanent) { existingE = ee; break; }
             }
             if (existingE) {
+                // 已存在同状态效果：叠加强度或时长
                 if (def.stackIntensity) existingE.stacks = (existingE.stacks || 1) + count;
-                if (!isPermanent) existingE.duration += durationValue;
-                if (isPermanent && def.boy) existingE.boyDuration = (existingE.boyDuration || 0) + 1;
-                else if (!isPermanent && def.boy) existingE.boyDuration = (existingE.boyDuration || 0) + durationValue;
+                if (!isPermanent) existingE.duration += def.duration * count;
+                // 男孩部分
+                if (def.boy) {
+                    if (isPermanent) existingE.boyDuration = (existingE.boyDuration || 0) + 1;
+                    else existingE.boyDuration = (existingE.boyDuration || 0) + def.duration * count;
+                }
             } else {
+                // 新建效果
                 target.effects.push({
                     rank: rank, name: def.name, desc: def.desc,
-                    duration: durationValue, permanent: isPermanent,
+                    duration: isPermanent ? 0 : def.duration * count,
+                    permanent: isPermanent,
                     stacks: def.stackIntensity ? count : 1,
                     boy: def.boy || '',
-                    boyDuration: isPermanent && def.boy ? 1 : (def.boy ? durationValue : 0)
+                    boyDuration: def.boy ? (isPermanent ? 1 : def.duration * count) : 0
                 });
             }
         }
     }
 
-    // 7 结算：计算应脱数量，不修改衣物，累加 pendingStrip
+    // 7 结算：读剩余衣物，累加 pendingStrip，剩余加到扩张
     function settleSeven(playerIdx, count) {
         var p = G.players[playerIdx];
         var available = Math.max(0, (p.clothes.length || 0) - (p.pendingStrip || 0));
@@ -356,6 +357,7 @@
         if (excess > 0) handleExpandEffect(playerIdx, excess);
     }
 
+    // 7 扩张：stacks 上限 6，超出加 duration
     function handleExpandEffect(playerIdx, count) {
         var p = G.players[playerIdx];
         var existing = null;
@@ -370,11 +372,17 @@
                 existing.duration = (existing.duration || 1) + excess;
             }
         } else {
+            var initStacks = count;
+            var initDuration = 1;
+            if (initStacks > 6) {
+                initDuration = 1 + (initStacks - 6);
+                initStacks = 6;
+            }
             p.effects.push({
                 rank: '7_expand', name: '7扩张',
                 desc: '阴道被魔法撑开，内壁扩张合不拢。层数越高打开部位越多。',
-                duration: 1, permanent: false,
-                stacks: Math.min(count, 6),
+                duration: initDuration, permanent: false,
+                stacks: initStacks,
                 boy: '', boyDuration: 0, isGameDuration: true
             });
         }
@@ -409,30 +417,28 @@
         }
     }
 
-    // 王炸：所有效果都不延迟（ignoreLock = true）
+    // 王炸：3/5/8 变永久，其他正常；所有效果都不延迟
     function triggerRocket(playerIdx) {
         G.rocketCount++;
         G.multiplier += 2;
-        // 批量：先汇总
-        var batch = {};
+        var permanentRanks = { '3': true, '5': true, '8': true };
         for (var i = 0; i < TRIGGER_ORDER.length; i++) {
             var rank = TRIGGER_ORDER[i];
             var actual = calcTriggerCount(playerIdx, 4);
-            batch[rank] = (batch[rank] || 0) + actual;
+            if (permanentRanks[rank]) {
+                // 3/5/8 变永久（独立条目，不影响已有非永久）
+                addEffect(playerIdx, rank, actual, true);
+            } else {
+                addEffect(playerIdx, rank, actual);
+            }
         }
-        // 小王额外 +1 次
-        batch['小王'] = (batch['小王'] || 0) + calcTriggerCount(playerIdx, 1);
-        // 一次性 apply，全部 ignoreLock
-        for (var j = 0; j < TRIGGER_ORDER.length; j++) {
-            var r = TRIGGER_ORDER[j];
-            if (!batch[r]) continue;
-            addEffect(playerIdx, r, batch[r]);
-        }
+        // 小王 1 次
+        var sowExtra = calcTriggerCount(playerIdx, 1);
+        addEffect(playerIdx, '小王', sowExtra);
     }
 
     function flushPendingEffects(playerIdx) {
-        var pending = [];
-        var rest = [];
+        var pending = [], rest = [];
         for (var i = 0; i < G.pendingEffects.length; i++) {
             if (G.pendingEffects[i].playerIdx === playerIdx) pending.push(G.pendingEffects[i]);
             else rest.push(G.pendingEffects[i]);
@@ -641,6 +647,7 @@
         G.phase = 'bid';
         G.currentTurn = G.bidStartIndex;
         G.hasActed = [false, false, false];
+        G.passCount = 0;
         for (var p = 0; p < 3; p++) {
             G.players[p].bid = null;
             G.players[p].hasGrabbed = false;
@@ -682,14 +689,12 @@
                 if (p.effects[i].rank === '不叫惩罚') { exNo = p.effects[i]; break; }
             }
             if (exNo) { exNo.stacks += 1; exNo.duration += 2; }
-            else {
-                p.effects.push({
-                    rank: '不叫惩罚', name: '不叫惩罚',
-                    desc: '肛门敏感度翻3倍，连续不叫叠加',
-                    duration: 2, permanent: false, stacks: 1,
-                    boy: '', boyDuration: 0
-                });
-            }
+            else p.effects.push({
+                rank: '不叫惩罚', name: '不叫惩罚',
+                desc: '肛门敏感度翻3倍，连续不叫叠加',
+                duration: 2, permanent: false, stacks: 1,
+                boy: '', boyDuration: 0
+            });
         } else {
             var num = parseInt(value);
             p.baseScore = num;
@@ -773,6 +778,7 @@
         G.phase = 'play';
         G.currentTurn = G.motherIndex;
         G.hasActed = [false, false, false];
+        G.passCount = 0;
     }
 
     function doPlay(playerIdx, inputStr) {
@@ -816,6 +822,7 @@
 
         var t = getCardType(cards);
         G.lastPlayed = { playerIdx: playerIdx, cards: cards, type: t.type, main: t.main, len: t.len, legal: legal };
+        G.passCount = 0; // 有人出牌，重置 pass
 
         if (p.hand.length === 0) { endRound(playerIdx); return; }
         G.hasActed[playerIdx] = true;
@@ -829,12 +836,18 @@
         G.playPile.push({ player: G.players[playerIdx].name, cards: '不出' });
         if (G.playPile.length > MAX_PILE) G.playPile = G.playPile.slice(-MAX_PILE);
         G.hasActed[playerIdx] = true;
+        G.passCount++;
+        // 两人都过（连续两次不出），自由出牌
+        if (G.passCount >= 2 && G.lastPlayed) {
+            G.lastPlayed = null;
+            G.passCount = 0;
+        }
         advanceTurn((playerIdx + 1) % 3);
         invalidateCache();
         saveNow(); renderUI(); injectState();
     }
 
-    // 超时：触发所有手牌（不再排除任何牌）
+    // 超时：触发该玩家所有手牌效果（不排除任何牌），遵从婊子共享
     function doTimeout() {
         var pIdx = G.currentTurn;
         if (pIdx < 0 || pIdx > 2) { alert('当前无行动玩家'); return; }
@@ -855,6 +868,11 @@
         G.playPile.push({ player: p.name, cards: '超时' });
         if (G.playPile.length > MAX_PILE) G.playPile = G.playPile.slice(-MAX_PILE);
         G.hasActed[pIdx] = true;
+        G.passCount++;
+        if (G.passCount >= 2 && G.lastPlayed) {
+            G.lastPlayed = null;
+            G.passCount = 0;
+        }
         advanceTurn((pIdx + 1) % 3);
         invalidateCache();
         saveNow(); renderUI(); injectState();
@@ -892,16 +910,31 @@
             }
             pl.score -= extra;
         }
+        // 7 扩张每局结束：stacks -1 且 duration -1，任一归零消失
         for (var q = 0; q < 3; q++) {
-            G.players[q].effects = G.players[q].effects.filter(function (e) { return !e.isGameDuration; });
-        }
-        for (var r = 0; r < 3; r++) {
-            var pp = G.players[r];
+            var pp = G.players[q];
+            var newEff = [];
             for (var s = 0; s < pp.effects.length; s++) {
                 var eff = pp.effects[s];
-                if (!eff.permanent && !eff.isInstant && !eff.isGameDuration && eff.duration > 0) {
-                    eff.duration *= 180;
-                    eff.durationType = 'sec';
+                if (eff.isGameDuration) {
+                    eff.stacks = (eff.stacks || 1) - 1;
+                    eff.duration = (eff.duration || 1) - 1;
+                    if (eff.stacks > 0 && eff.duration > 0) newEff.push(eff);
+                    // 否则丢弃
+                } else {
+                    newEff.push(eff);
+                }
+            }
+            pp.effects = newEff;
+        }
+        // 进中场：轮→秒（1轮 = 180秒）
+        for (var r = 0; r < 3; r++) {
+            var ppp = G.players[r];
+            for (var t = 0; t < ppp.effects.length; t++) {
+                var ee = ppp.effects[t];
+                if (!ee.permanent && !ee.isInstant && !ee.isGameDuration && ee.duration > 0) {
+                    ee.duration *= ROUND_SECONDS_IN;
+                    ee.durationType = 'sec';
                 }
             }
         }
@@ -920,12 +953,25 @@
         G.bottomCards = [];
         G.pendingEffects = [];
         G.hasActed = [false, false, false];
+        G.passCount = 0;
         G.lastPlayed = null;
+        // 出中场：秒→轮（每 60 秒 = 1 轮，向上取整）
         for (var i = 0; i < 3; i++) {
-            G.players[i].hand = [];
-            G.players[i].role = '';
-            G.players[i].bid = null;
-            G.players[i].hasGrabbed = false;
+            var p = G.players[i];
+            for (var j = 0; j < p.effects.length; j++) {
+                var e = p.effects[j];
+                if (e.durationType === 'sec' && !e.permanent) {
+                    e.duration = Math.ceil(e.duration / ROUND_SECONDS_OUT);
+                    e.durationType = 'round';
+                }
+            }
+            p.effects = p.effects.filter(function (e) {
+                return e.permanent || e.isInstant || e.isGameDuration || e.duration > 0;
+            });
+            p.hand = [];
+            p.role = '';
+            p.bid = null;
+            p.hasGrabbed = false;
         }
         invalidateCache();
         saveNow(); renderUI(); injectState();
@@ -960,9 +1006,10 @@
         saveNow(); renderUI(); injectState();
     }
 
+    // 编辑手牌：预填用空格分隔（修复多小王）
     function editHand(playerIdx) {
         var p = G.players[playerIdx];
-        var cur = p.hand.join('');
+        var cur = p.hand.join(' ');   // ← 空格分隔
         var input = prompt('输入该玩家手牌（格式如 34567 10JQKA 大小）：', cur);
         if (input === null) return;
         var cards = parseCards(input);
@@ -975,13 +1022,9 @@
 
     // ===== 状态注入 =====
     function clothesText(p) {
-        if (!p.clothes || p.clothes.length === 0) {
-            if (p.pendingStrip > 0) return '全裸';
-            return '全裸';
-        }
-        var remaining = p.clothes.length;
+        if (!p.clothes || p.clothes.length === 0) return '全裸';
         var pending = p.pendingStrip || 0;
-        var remain = remaining - pending;
+        var remain = p.clothes.length - pending;
         var s = '剩余 ' + remain + ' 件';
         if (pending > 0) s += '（还要脱 ' + pending + ' 件）';
         return s;
@@ -1008,7 +1051,8 @@
                     else if (e.isGameDuration) dur = '剩余' + e.duration + '局';
                     else dur = e.duration + (e.durationType === 'sec' ? '秒' : '轮');
                     txt += '  - ' + e.name + '（层数' + (e.stacks || 1) + '，' + dur + '）';
-                    if (e.boy) txt += ' | 男孩：' + e.boy;
+                    if (e.boy && e.boyDuration > 0) txt += ' | 男孩：' + e.boy + '（' + e.boyDuration + '轮）';
+                    else if (e.boy) txt += ' | 男孩：' + e.boy;
                     txt += '\n    ' + e.desc + '\n';
                 }
             } else {
@@ -1018,6 +1062,8 @@
         }
         if (G.lastPlayed) {
             txt += '上一手：' + G.players[G.lastPlayed.playerIdx].name + ' 出 ' + G.lastPlayed.cards.join(' ') + (G.lastPlayed.legal ? '' : '（非法）') + '\n';
+        } else if (G.phase === 'play') {
+            txt += '当前自由出牌\n';
         }
         if (G.playPile.length) {
             var recent = G.playPile.slice(-PILE_INJECT).map(function (x) { return x.player + ':' + x.cards; }).join(' → ');
@@ -1030,10 +1076,8 @@
     function injectState() {
         try {
             var c = getCtx();
-            if (c && c.setExtensionPrompt) {
-                c.setExtensionPrompt(EXT_NAME, buildStateText(), 1, 0, false, 0);
-            }
-        } catch (e) { console.warn('[DouSow] inject error', e); }
+            if (c && c.setExtensionPrompt) c.setExtensionPrompt(EXT_NAME, buildStateText(), 1, 0, false, 0);
+        } catch (e) {}
         window.DouSowStateText = buildStateText();
     }
 
@@ -1058,7 +1102,6 @@
     function createUI() {
         var old = document.getElementById('dousow-panel');
         if (old) old.remove();
-
         panel = document.createElement('div');
         panel.id = 'dousow-panel';
         panel.style.setProperty('position', 'fixed', 'important');
@@ -1080,35 +1123,26 @@
 
         var head = document.createElement('div');
         head.style.cssText = 'padding:8px 12px;background:linear-gradient(135deg,#8b1a3a,#c23a6a);color:#fff;font-weight:bold;border-radius:10px 10px 0 0;user-select:none;display:flex;justify-content:space-between;align-items:center;';
-
         var title = document.createElement('span');
         title.textContent = '🐷 斗母猪';
         head.appendChild(title);
-
         var btns = document.createElement('span');
-
         function mkIconBtn(icon, title, handler) {
             var b = document.createElement('button');
-            b.textContent = icon;
-            b.title = title;
+            b.textContent = icon; b.title = title;
             b.style.cssText = 'background:#fff;color:#8b1a3a;border:none;border-radius:6px;padding:3px 8px;margin-left:3px;font-size:13px;font-weight:bold;cursor:pointer;';
             b.onclick = handler;
             return b;
         }
-
         btns.appendChild(mkIconBtn('⏱', '超时', doTimeout));
         btns.appendChild(mkIconBtn('👗', '衣物', openClothesEditor));
         btns.appendChild(mkIconBtn('⚙', '效果', openEffectEditor));
         btns.appendChild(mkIconBtn('🎨', '背景', cycleBg));
-        btns.appendChild(mkIconBtn('⌂', '归位', function () {
-            userMovedPanel = false;
-            placePanelBottomRight();
-        }));
+        btns.appendChild(mkIconBtn('⌂', '归位', function () { userMovedPanel = false; placePanelBottomRight(); }));
         btns.appendChild(mkIconBtn('—', '最小化', function () {
             var b = document.getElementById('ds-body');
             b.style.display = (b.style.display === 'none') ? 'block' : 'none';
         }));
-
         head.appendChild(btns);
         panel.appendChild(head);
 
@@ -1116,27 +1150,22 @@
         body.id = 'ds-body';
         body.style.cssText = 'padding:8px;overflow-y:auto;flex:1;cursor:auto;';
         panel.appendChild(body);
-
         document.body.appendChild(panel);
 
         panel.addEventListener('mousedown', function (e) {
             var tag = e.target.tagName;
             if (tag === 'BUTTON' || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-            isDragging = true;
-            userMovedPanel = true;
+            isDragging = true; userMovedPanel = true;
             var r = panel.getBoundingClientRect();
-            dragOff.x = e.clientX - r.left;
-            dragOff.y = e.clientY - r.top;
+            dragOff.x = e.clientX - r.left; dragOff.y = e.clientY - r.top;
         });
         panel.addEventListener('touchstart', function (e) {
             var tag = e.target.tagName;
             if (tag === 'BUTTON' || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-            isDragging = true;
-            userMovedPanel = true;
+            isDragging = true; userMovedPanel = true;
             var t = e.touches[0];
             var r = panel.getBoundingClientRect();
-            dragOff.x = t.clientX - r.left;
-            dragOff.y = t.clientY - r.top;
+            dragOff.x = t.clientX - r.left; dragOff.y = t.clientY - r.top;
         }, { passive: true });
         document.addEventListener('mousemove', function (e) {
             if (!isDragging) return;
@@ -1159,11 +1188,7 @@
         setTimeout(function () { if (!userMovedPanel) placePanelBottomRight(); }, 50);
         setTimeout(function () { if (!userMovedPanel) placePanelBottomRight(); }, 300);
         setTimeout(function () { if (!userMovedPanel) placePanelBottomRight(); }, 1000);
-
-        window.addEventListener('resize', function () {
-            if (!userMovedPanel) placePanelBottomRight();
-        });
-
+        window.addEventListener('resize', function () { if (!userMovedPanel) placePanelBottomRight(); });
         return panel;
     }
 
@@ -1184,13 +1209,21 @@
         saveLazy();
     }
 
-    // 渲染节流
     function renderUI() {
         if (renderTimer) return;
-        renderTimer = setTimeout(function () {
-            renderTimer = null;
-            doRenderUI();
-        }, 30);
+        renderTimer = setTimeout(function () { renderTimer = null; doRenderUI(); }, 30);
+    }
+
+    // 效果行：主效果 + 男孩合并
+    function effectLine(e) {
+        var dur;
+        if (e.permanent) dur = '永久';
+        else if (e.isInstant) dur = '剩余' + (e.remainingCount || 0) + '次';
+        else if (e.isGameDuration) dur = e.duration + '局';
+        else dur = e.duration + (e.durationType === 'sec' ? '秒' : '轮');
+        var s = '· ' + e.name + (e.stacks > 1 ? '×' + e.stacks : '') + '（' + dur + '）';
+        if (e.boy && e.boyDuration > 0) s += '｜男孩 ' + e.boyDuration + '轮';
+        return s;
     }
 
     function doRenderUI() {
@@ -1215,7 +1248,6 @@
         for (var i = 0; i < 3; i++) {
             var p = G.players[i];
             var isCur = (i === G.currentTurn);
-
             var card = document.createElement('div');
             card.style.cssText = 'margin-bottom:6px;padding:8px;border-radius:8px;background:rgba(139,26,58,0.2);border-left:3px solid ' + (p.role === '母猪' ? '#ff3366' : '#c23a6a') + ';';
 
@@ -1225,8 +1257,7 @@
             card.appendChild(nameRow);
 
             var nameInput = document.createElement('input');
-            nameInput.type = 'text';
-            nameInput.value = p.name;
+            nameInput.type = 'text'; nameInput.value = p.name;
             nameInput.setAttribute('data-name', i);
             nameInput.style.cssText = 'width:70px;background:#2a1010;color:#fff;border:1px solid #666;border-radius:4px;padding:2px 4px;margin-top:2px;font-size:11px;';
             card.appendChild(nameInput);
@@ -1245,14 +1276,8 @@
                 var effDiv = document.createElement('div');
                 effDiv.style.cssText = 'font-size:10px;color:#ff99bb;margin-top:2px;';
                 for (var j = 0; j < p.effects.length; j++) {
-                    var e = p.effects[j];
-                    var dur;
-                    if (e.permanent) dur = '永久';
-                    else if (e.isInstant) dur = '剩余' + (e.remainingCount || 0) + '次';
-                    else if (e.isGameDuration) dur = e.duration + '局';
-                    else dur = e.duration + (e.durationType === 'sec' ? '秒' : '轮');
                     var line = document.createElement('div');
-                    line.textContent = '· ' + e.name + (e.stacks > 1 ? '×' + e.stacks : '') + '（' + dur + '）';
+                    line.textContent = effectLine(p.effects[j]);
                     effDiv.appendChild(line);
                 }
                 card.appendChild(effDiv);
@@ -1261,7 +1286,6 @@
             var btnRow = document.createElement('div');
             btnRow.style.cssText = 'margin-top:4px;display:flex;flex-wrap:wrap;gap:2px;';
             btnRow.appendChild(styledBtn('编辑手牌', (function (idx) { return function () { editHand(idx); }; })(i)));
-
             var has10 = false;
             for (var k = 0; k < p.effects.length; k++) {
                 if (p.effects[k].rank === '10' && p.effects[k].isInstant) { has10 = true; break; }
@@ -1290,21 +1314,17 @@
                 var playRow = document.createElement('div');
                 playRow.style.cssText = 'margin-top:4px;display:flex;gap:4px;';
                 var input = document.createElement('input');
-                input.type = 'text';
-                input.id = 'ds-play-' + i;
+                input.type = 'text'; input.id = 'ds-play-' + i;
                 input.placeholder = '如34567';
                 input.style.cssText = 'flex:1;background:#2a1010;color:#fff;border:1px solid #666;border-radius:4px;padding:3px 6px;font-size:11px;min-width:0;';
                 playRow.appendChild(input);
-                playRow.appendChild(styledBtn('出', (function (idx) {
-                    return function () {
-                        var inp = document.getElementById('ds-play-' + idx);
-                        if (inp) doPlay(idx, inp.value);
-                    };
-                })(i)));
+                playRow.appendChild(styledBtn('出', (function (idx) { return function () {
+                    var inp = document.getElementById('ds-play-' + idx);
+                    if (inp) doPlay(idx, inp.value);
+                }; })(i)));
                 playRow.appendChild(styledBtn('不出', (function (idx) { return function () { doPass(idx); }; })(i)));
                 card.appendChild(playRow);
             }
-
             body.appendChild(card);
         }
 
@@ -1313,8 +1333,7 @@
             secRow.style.cssText = 'margin-top:6px;';
             secRow.textContent = '已过秒数：';
             var secInput = document.createElement('input');
-            secInput.type = 'number';
-            secInput.id = 'dousow-sec';
+            secInput.type = 'number'; secInput.id = 'dousow-sec';
             secInput.style.cssText = 'width:70px;background:#2a1010;color:#fff;border:1px solid #666;border-radius:4px;padding:3px;';
             secRow.appendChild(secInput);
             secRow.appendChild(styledBtn('确认', applySeconds));
@@ -1335,29 +1354,26 @@
                 inp.onchange = function () {
                     var idx = parseInt(inp.getAttribute('data-name'));
                     G.players[idx].name = inp.value || PLAYER_NAMES[idx];
-                    invalidateCache();
-                    saveLazy(); injectState();
+                    invalidateCache(); saveLazy(); injectState();
                 };
             })(nameInputs[n]);
         }
     }
 
+    // ===== 衣物编辑器：脱衣撤回 =====
     function openClothesEditor() {
         var exist = document.getElementById('dousow-clothes');
         if (exist) exist.remove();
-
         var div = document.createElement('div');
         div.id = 'dousow-clothes';
         div.style.cssText = 'position:fixed;left:5%;top:5%;width:90%;max-width:520px;max-height:85vh;background:#2a0a12;color:#ffe0e8;padding:14px;border-radius:12px;z-index:2147483646;overflow:auto;border:2px solid #8b1a3a;font-size:12px;';
 
         var headerRow = document.createElement('div');
         headerRow.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;';
-
         var h = document.createElement('h3');
         h.style.cssText = 'margin:0;color:#ff88aa;';
         h.textContent = '👗 衣物管理';
         headerRow.appendChild(h);
-
         var rightBtns = document.createElement('span');
         rightBtns.appendChild(styledBtn('↻ 恢复默认', function () {
             if (!confirm('确定恢复默认衣物？当前修改会丢失。')) return;
@@ -1365,8 +1381,7 @@
                 G.players[i].clothes = DEFAULT_CLOTHES[i].slice();
                 G.players[i].pendingStrip = 0;
             }
-            invalidateCache();
-            saveNow(); renderUI(); injectState(); renderList();
+            invalidateCache(); saveNow(); renderUI(); injectState(); renderList();
         }));
         rightBtns.appendChild(styledBtn('✕ 关闭', function () { div.remove(); }));
         headerRow.appendChild(rightBtns);
@@ -1374,7 +1389,7 @@
 
         var hint = document.createElement('div');
         hint.style.cssText = 'font-size:10px;color:#ffaabb;margin-bottom:8px;';
-        hint.textContent = '每件衣物单独一行。7 触发后显示"还要脱 N 件"，你手动删。';
+        hint.textContent = '点"脱"移除一件（可撤回）。7 触发后显示"还要脱 N 件"。';
         div.appendChild(hint);
 
         function renderList() {
@@ -1384,16 +1399,13 @@
                 var p = G.players[i];
                 var block = document.createElement('div');
                 block.style.cssText = 'border-top:1px solid #5a1a2a;padding:8px 0;';
-
                 var nameLabel = document.createElement('b');
                 nameLabel.style.color = '#ff99bb';
-                nameLabel.textContent = p.name + (p.role ? ' (' + p.role + ')' : '') + ' — ' + (p.clothes.length === 0 && p.pendingStrip === 0 ? '全裸' : ('剩余 ' + (p.clothes.length - p.pendingStrip) + ' 件'));
-                if (p.pendingStrip > 0) nameLabel.textContent += '（还要脱 ' + p.pendingStrip + ' 件）';
+                nameLabel.textContent = p.name + (p.role ? ' (' + p.role + ')' : '') + ' — ' + clothesText(p);
                 block.appendChild(nameLabel);
 
                 var listDiv = document.createElement('div');
                 listDiv.style.marginTop = '4px';
-
                 if (p.clothes.length === 0) {
                     var empty = document.createElement('div');
                     empty.style.cssText = 'font-size:11px;color:#888;';
@@ -1417,14 +1429,16 @@
                                 saveLazy(); injectState(); renderUI();
                             };
                             rw.appendChild(itemInput);
-                            rw.appendChild(styledBtn('×', function () {
+                            // "脱"按钮：推入撤回栈，pendingStrip -1
+                            rw.appendChild(styledBtn('脱', function () {
+                                pushUndo();
                                 G.players[playerIdx].clothes.splice(itemIdx, 1);
                                 if (G.players[playerIdx].pendingStrip > 0) {
                                     G.players[playerIdx].pendingStrip = Math.max(0, G.players[playerIdx].pendingStrip - 1);
                                 }
                                 invalidateCache();
                                 saveNow(); injectState(); renderUI(); renderList();
-                            }, { bg: '#5a0a1a' }));
+                            }, { bg: '#8b1a3a' }));
                             listDiv.appendChild(rw);
                         })(i, j);
                     }
@@ -1443,13 +1457,11 @@
                     btnLine.appendChild(styledBtn('已脱完', (function (playerIdx) {
                         return function () {
                             G.players[playerIdx].pendingStrip = 0;
-                            invalidateCache();
-                            saveNow(); injectState(); renderUI(); renderList();
+                            invalidateCache(); saveNow(); injectState(); renderUI(); renderList();
                         };
                     })(i), { bg: '#5a8a3a' }));
                 }
                 block.appendChild(btnLine);
-
                 listContainer.appendChild(block);
             }
         }
@@ -1457,7 +1469,6 @@
         var listContainer = document.createElement('div');
         listContainer.id = 'ds-clothes-list';
         div.appendChild(listContainer);
-
         document.body.appendChild(div);
         renderList();
     }
@@ -1465,14 +1476,11 @@
     function openEffectEditor() {
         var exist = document.getElementById('dousow-editor');
         if (exist) exist.remove();
-
         var div = document.createElement('div');
         div.id = 'dousow-editor';
         div.style.cssText = 'position:fixed;left:5%;top:5%;width:90%;max-width:520px;max-height:85vh;background:#2a0a12;color:#ffe0e8;padding:14px;border-radius:12px;z-index:2147483646;overflow:auto;border:2px solid #8b1a3a;font-size:12px;';
-
         var headerRow = document.createElement('div');
         headerRow.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;';
-
         var h = document.createElement('h3');
         h.style.cssText = 'margin:0;color:#ff88aa;';
         h.textContent = '⚙ 效果编辑器';
@@ -1492,8 +1500,7 @@
             label.textContent = r + (locked ? ' (锁定)' : '');
             block.appendChild(label);
             var descArea = document.createElement('textarea');
-            descArea.setAttribute('data-k', r);
-            descArea.setAttribute('data-f', 'desc');
+            descArea.setAttribute('data-k', r); descArea.setAttribute('data-f', 'desc');
             descArea.style.cssText = 'width:100%;height:40px;background:#1a0508;color:#ffe0e8;border:1px solid #c23a6a;border-radius:4px;margin-top:3px;font-size:11px;';
             descArea.value = e.desc || '';
             if (locked) descArea.readOnly = true;
@@ -1503,8 +1510,7 @@
             durDiv.textContent = '单次轮数：';
             var durInput = document.createElement('input');
             durInput.type = 'number';
-            durInput.setAttribute('data-k', r);
-            durInput.setAttribute('data-f', 'duration');
+            durInput.setAttribute('data-k', r); durInput.setAttribute('data-f', 'duration');
             durInput.value = (e.duration != null ? e.duration : 1);
             durInput.style.cssText = 'width:50px;background:#1a0508;color:#ffe0e8;border:1px solid #c23a6a;border-radius:4px;';
             if (locked) durInput.disabled = true;
@@ -1512,8 +1518,7 @@
             durDiv.appendChild(document.createTextNode(' 叠加强度：'));
             var stackInput = document.createElement('input');
             stackInput.type = 'checkbox';
-            stackInput.setAttribute('data-k', r);
-            stackInput.setAttribute('data-f', 'stackIntensity');
+            stackInput.setAttribute('data-k', r); stackInput.setAttribute('data-f', 'stackIntensity');
             stackInput.checked = !!e.stackIntensity;
             if (locked) stackInput.disabled = true;
             durDiv.appendChild(stackInput);
@@ -1523,8 +1528,7 @@
             boyDiv.textContent = '男孩效果：';
             var boyInput = document.createElement('input');
             boyInput.type = 'text';
-            boyInput.setAttribute('data-k', r);
-            boyInput.setAttribute('data-f', 'boy');
+            boyInput.setAttribute('data-k', r); boyInput.setAttribute('data-f', 'boy');
             boyInput.value = e.boy || '';
             boyInput.style.cssText = 'width:70%;background:#1a0508;color:#ffe0e8;border:1px solid #c23a6a;border-radius:4px;padding:3px 6px;';
             if (locked) boyInput.readOnly = true;
@@ -1532,21 +1536,16 @@
             block.appendChild(boyDiv);
             div.appendChild(block);
         }
-
         var btnRow = document.createElement('div');
         btnRow.style.marginTop = '10px';
         btnRow.appendChild(styledBtn('保存全部', saveEffects));
         btnRow.appendChild(styledBtn('导出JSON', exportEffects));
         btnRow.appendChild(styledBtn('导入JSON', importEffects));
         div.appendChild(btnRow);
-
         var fileInput = document.createElement('input');
-        fileInput.type = 'file';
-        fileInput.id = 'ds-import-file';
-        fileInput.accept = '.json';
-        fileInput.style.display = 'none';
+        fileInput.type = 'file'; fileInput.id = 'ds-import-file';
+        fileInput.accept = '.json'; fileInput.style.display = 'none';
         div.appendChild(fileInput);
-
         document.body.appendChild(div);
     }
 
@@ -1561,17 +1560,14 @@
             else if (f === 'duration') effectsDB[k][f] = parseInt(el.value) || 0;
             else effectsDB[k][f] = el.value;
         }
-        invalidateCache();
-        saveNow();
+        invalidateCache(); saveNow();
         alert('已保存');
     }
 
     function exportEffects() {
         var blob = new Blob([JSON.stringify(effectsDB, null, 2)], { type: 'application/json' });
         var a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = 'dousow_effects.json';
-        a.click();
+        a.href = URL.createObjectURL(blob); a.download = 'dousow_effects.json'; a.click();
     }
 
     function importEffects() {
@@ -1583,8 +1579,7 @@
             reader.onload = function (e2) {
                 try {
                     effectsDB = Object.assign({}, DEFAULT_EFFECTS, JSON.parse(e2.target.result));
-                    invalidateCache();
-                    saveNow();
+                    invalidateCache(); saveNow();
                     var ed = document.getElementById('dousow-editor');
                     if (ed) ed.remove();
                     openEffectEditor();
@@ -1602,28 +1597,17 @@
             c.eventSource.on(c.eventTypes.GENERATION_STARTED, function () {
                 if (G && G.phase !== 'idle') injectState();
             });
-        } catch (e) { console.warn('[DouSow] setupEvents', e); }
+        } catch (e) {}
     }
 
     function exposeAPI() {
         window.DouSow = {
-            startNewGame: startNewGame,
-            doDeal: doDeal,
-            doBid: doBid,
-            doGrab: doGrab,
-            doPlay: doPlay,
-            doPass: doPass,
-            doTimeout: doTimeout,
-            doUndo: doUndo,
-            nextRound: nextRound,
-            applySeconds: applySeconds,
-            reduce10: reduce10,
-            editHand: editHand,
-            openEffectEditor: openEffectEditor,
-            openClothesEditor: openClothesEditor,
+            startNewGame: startNewGame, doDeal: doDeal, doBid: doBid, doGrab: doGrab,
+            doPlay: doPlay, doPass: doPass, doTimeout: doTimeout, doUndo: doUndo,
+            nextRound: nextRound, applySeconds: applySeconds, reduce10: reduce10,
+            editHand: editHand, openEffectEditor: openEffectEditor, openClothesEditor: openClothesEditor,
             placeBottomRight: placePanelBottomRight,
-            getState: function () { return G; },
-            getStateText: buildStateText
+            getState: function () { return G; }, getStateText: buildStateText
         };
     }
 
@@ -1634,7 +1618,7 @@
         injectState();
         setupEvents();
         exposeAPI();
-        console.log('[DouSow] 插件已加载 v8');
+        console.log('[DouSow] 插件已加载 v9');
     }
 
     if (document.readyState === 'loading') {
