@@ -1,11 +1,11 @@
-// DouMZ.js - 斗母猪 SillyTavern 扩展（完整版 v11）
+// DouMZ.js - 斗母猪 SillyTavern 扩展（完整版 v12）
 (function () {
     'use strict';
 
     const EXT_NAME = 'DouSow';
-    const STORAGE_KEY = 'dousow_state_v14';
-    const EFFECT_KEY = 'dousow_effects_v14';
-    const UI_KEY = 'dousow_ui_v14';
+    const STORAGE_KEY = 'dousow_state_v15';
+    const EFFECT_KEY = 'dousow_effects_v15';
+    const UI_KEY = 'dousow_ui_v15';
     const PLAYER_NAMES = ['塞拉', '诺亚', '薇拉'];
     const TRIGGER_ORDER = ['3','8','4','5','6','7','10','A','2','J','Q','K','小王','9'];
     const RANK_VALUE = { '3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'10':10,'J':13,'Q':14,'K':15,'A':11,'2':12,'小王':16,'大王':17 };
@@ -64,6 +64,7 @@
             lastMotherIndex: -1,
             consecutiveMother: [0,0,0],
             hasActed: [false, false, false],
+            unseated: [false, false, false],
             passCount: 0,
             players: PLAYER_NAMES.map(function (name, idx) {
                 return {
@@ -148,6 +149,7 @@
         if (!G) G = defaultState();
         if (!Array.isArray(G.actionHistory)) G.actionHistory = [];
         if (!Array.isArray(G.hasActed)) G.hasActed = [false, false, false];
+        if (!Array.isArray(G.unseated)) G.unseated = [false, false, false];
         if (typeof G.passCount !== 'number') G.passCount = 0;
         for (var i = 0; i < G.players.length; i++) {
             var c = G.players[i].clothes;
@@ -171,6 +173,7 @@
             tempMotherIndex: G.tempMotherIndex,
             consecutiveMother: G.consecutiveMother,
             hasActed: G.hasActed,
+            unseated: G.unseated,
             passCount: G.passCount,
             players: G.players.map(function (p) {
                 return {
@@ -634,6 +637,7 @@
         G.phase = 'bid';
         G.currentTurn = G.bidStartIndex;
         G.hasActed = [false, false, false];
+        G.unseated = [false, false, false];  // 发牌时清空未上桌标记
         G.passCount = 0;
         for (var p = 0; p < 3; p++) {
             G.players[p].bid = null;
@@ -936,6 +940,7 @@
         G.bottomCards = [];
         G.pendingEffects = [];
         G.hasActed = [false, false, false];
+        G.unseated = [false, false, false];
         G.passCount = 0;
         G.lastPlayed = null;
         for (var i = 0; i < 3; i++) {
@@ -984,6 +989,7 @@
     function triggerRule14For(playerIdx) {
         pushUndo();
         handleExpandEffect(playerIdx, 1);
+        G.unseated[playerIdx] = true;   // 标记未上桌，注入文本用
         invalidateCache();
         saveNow(); renderUI(); injectState();
     }
@@ -1024,6 +1030,9 @@
             txt += '手牌：' + (p.hand.join(' ') || '无') + '\n';
             txt += clothesText(p) + '\n';
             txt += '连续当母猪：' + G.consecutiveMother[i] + '\n';
+            if (G.unseated && G.unseated[i]) {
+                txt += '【剧情触发】游戏开始时，' + p.name + '未上桌，顺延当前剧情触发规则14。\n';
+            }
             if (p.effects.length) {
                 txt += '效果：\n';
                 for (var j = 0; j < p.effects.length; j++) {
@@ -1259,6 +1268,13 @@
             clothesInfo.style.cssText = 'font-size:10px;margin-top:2px;color:#ffbbcc;';
             clothesInfo.textContent = clothesText(p);
             card.appendChild(clothesInfo);
+
+            if (G.unseated && G.unseated[i]) {
+                var unseatInfo = document.createElement('div');
+                unseatInfo.style.cssText = 'font-size:10px;margin-top:2px;color:#ffdd88;';
+                unseatInfo.textContent = '⚠ 未上桌（已触发规则14）';
+                card.appendChild(unseatInfo);
+            }
 
             if (p.effects.length) {
                 var effDiv = document.createElement('div');
@@ -1604,7 +1620,7 @@
         injectState();
         setupEvents();
         exposeAPI();
-        console.log('[DouSow] 插件已加载 v11');
+        console.log('[DouSow] 插件已加载 v12');
     }
 
     if (document.readyState === 'loading') {
