@@ -1,14 +1,15 @@
-// DouMZ.js - 斗母猪 SillyTavern 扩展（完整版 v6）
+// DouMZ.js - 斗母猪 SillyTavern 扩展（完整版 v7）
 (function () {
     'use strict';
 
     const EXT_NAME = 'DouSow';
-    const STORAGE_KEY = 'dousow_state_v9';
-    const EFFECT_KEY = 'dousow_effects_v9';
-    const UI_KEY = 'dousow_ui_v9';
+    const STORAGE_KEY = 'dousow_state_v10';
+    const EFFECT_KEY = 'dousow_effects_v10';
+    const UI_KEY = 'dousow_ui_v10';
     const PLAYER_NAMES = ['塞拉', '诺亚', '薇拉'];
     const TRIGGER_ORDER = ['3','8','4','5','6','7','10','A','2','J','Q','K','小王','9'];
     const RANK_VALUE = { '3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'10':10,'J':13,'Q':14,'K':15,'A':11,'2':12,'小王':16,'大王':17 };
+    const SORT_KEY = { '大王':0,'小王':1,'2':2,'A':3,'K':4,'Q':5,'J':6,'10':7,'9':8,'8':9,'7':10,'6':11,'5':12,'4':13,'3':14 };
 
     const DEFAULT_EFFECTS = {
         '3': { name:'3', desc:'乳头与阴蒂敏感和大小增加3倍，男孩玩弄持续一轮。火箭触发时永久，男孩仅+1轮。', duration:1, stackIntensity:true, boy:'男孩玩弄乳头与阴蒂', locked:false },
@@ -40,6 +41,10 @@
     let panel = null;
     let isDragging = false;
     let dragOff = { x: 0, y: 0 };
+    let lastPlayed = null;
+    let renderTimer = null;
+    let saveTimer = null;
+    let userMovedPanel = false;
 
     function defaultState() {
         return {
@@ -63,29 +68,63 @@
             spring: false, antiSpring: false,
             actionHistory: [], pendingEffects: [],
             grabQueue: [], grabQueueIdx: 0,
-            intermissionSeconds: 0
+            intermissionSeconds: 0,
+            lastPlayed: null
         };
+    }
+
+    function getCtx() {
+        try { return window.SillyTavern.getContext(); } catch (e) { return null; }
     }
 
     function saveAll() {
         try {
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(G));
-            localStorage.setItem(EFFECT_KEY, JSON.stringify(effectsDB));
-            localStorage.setItem(UI_KEY, JSON.stringify(uiSettings));
-        } catch (e) { console.warn('[DouSow] save error', e); }
+            var s = JSON.stringify(G);
+            var e = JSON.stringify(effectsDB);
+            var u = JSON.stringify(uiSettings);
+            localStorage.setItem(STORAGE_KEY, s);
+            localStorage.setItem(EFFECT_KEY, e);
+            localStorage.setItem(UI_KEY, u);
+            var ctx = getCtx();
+            if (ctx && ctx.extensionSettings) {
+                if (!ctx.extensionSettings.dousow) ctx.extensionSettings.dousow = {};
+                ctx.extensionSettings.dousow.state = s;
+                ctx.extensionSettings.dousow.effects = e;
+                ctx.extensionSettings.dousow.ui = u;
+                if (ctx.saveSettingsDebounced) ctx.saveSettingsDebounced();
+            }
+        } catch (err) { console.warn('[DouSow] save error', err); }
+    }
+
+    function saveAllDebounced() {
+        if (saveTimer) clearTimeout(saveTimer);
+        saveTimer = setTimeout(saveAll, 400);
     }
 
     function loadAll() {
+        var loaded = false;
         try {
-            var s = localStorage.getItem(STORAGE_KEY);
-            if (s) G = JSON.parse(s);
-            var e = localStorage.getItem(EFFECT_KEY);
-            if (e) effectsDB = Object.assign({}, DEFAULT_EFFECTS, JSON.parse(e));
-            var u = localStorage.getItem(UI_KEY);
-            if (u) uiSettings = Object.assign(uiSettings, JSON.parse(u));
-        } catch (err) { console.warn('[DouSow] load error', err); }
+            var ctx = getCtx();
+            if (ctx && ctx.extensionSettings && ctx.extensionSettings.dousow) {
+                var d = ctx.extensionSettings.dousow;
+                if (d.state) { G = JSON.parse(d.state); loaded = true; }
+                if (d.effects) effectsDB = Object.assign({}, DEFAULT_EFFECTS, JSON.parse(d.effects));
+                if (d.ui) uiSettings = Object.assign(uiSettings, JSON.parse(d.ui));
+            }
+        } catch (e) { console.warn('[DouSow] ext settings load error', e); }
+        if (!loaded) {
+            try {
+                var s = localStorage.getItem(STORAGE_KEY);
+                if (s) { G = JSON.parse(s); loaded = true; }
+                var e2 = localStorage.getItem(EFFECT_KEY);
+                if (e2) effectsDB = Object.assign({}, DEFAULT_EFFECTS, JSON.parse(e2));
+                var u2 = localStorage.getItem(UI_KEY);
+                if (u2) uiSettings = Object.assign(uiSettings, JSON.parse(u2));
+            } catch (err) { console.warn('[DouSow] ls load error', err); }
+        }
         if (!G) G = defaultState();
         if (!Array.isArray(G.hasActed)) G.hasActed = [false, false, false];
+        if (!G.lastPlayed) G.lastPlayed = null;
         for (var i = 0; i < G.players.length; i++) {
             var c = G.players[i].clothes;
             if (typeof c === 'string') {
@@ -127,6 +166,10 @@
         return out;
     }
 
+    function sortHand(cards) {
+        return cards.slice().sort(function (a, b) { return (SORT_KEY[a] || 99) - (SORT_KEY[b] || 99); });
+    }
+
     function getEffectDef(rank) {
         return effectsDB[rank] || effectsDB[rank.toUpperCase()] || null;
     }
@@ -166,6 +209,7 @@
         return [playerIdx];
     }
 
+    // 核心 addEffect：单张效果增加（batch 时改调用 addEffectBatch）
     function addEffect(playerIdx, rank, count, forcePermanent) {
         var def = getEffectDef(rank);
         if (!def) return;
@@ -176,46 +220,52 @@
         }
 
         if (rank === '7') {
-            var p7 = G.players[playerIdx];
-            if (p7.clothes && p7.clothes.length > 0) {
-                p7.clothes.pop();
-                return;
+            var targets7 = getTargets(playerIdx);
+            for (var t7 = 0; t7 < targets7.length; t7++) {
+                settleSeven(targets7[t7], count);
             }
-            handleExpandEffect(playerIdx, count);
             return;
         }
 
         if (rank === '小王') {
-            var existing = null;
-            for (var i = 0; i < G.players[playerIdx].effects.length; i++) {
-                var e = G.players[playerIdx].effects[i];
-                if (e.rank === '小王' && !e.permanent) { existing = e; break; }
-            }
-            if (existing) { existing.duration += def.duration * count; }
-            else {
-                G.players[playerIdx].effects.push({
-                    rank: '小王', name: '小王', desc: def.desc,
-                    duration: def.duration * count, permanent: false,
-                    stacks: 1, boy: '', boyDuration: 0
-                });
+            var targetsS = getTargets(playerIdx);
+            for (var ts = 0; ts < targetsS.length; ts++) {
+                var tS = G.players[targetsS[ts]];
+                var existingS = null;
+                for (var is = 0; is < tS.effects.length; is++) {
+                    var eS = tS.effects[is];
+                    if (eS.rank === '小王' && !eS.permanent) { existingS = eS; break; }
+                }
+                if (existingS) { existingS.duration += def.duration * count; }
+                else {
+                    tS.effects.push({
+                        rank: '小王', name: '小王', desc: def.desc,
+                        duration: def.duration * count, permanent: false,
+                        stacks: 1, boy: '', boyDuration: 0
+                    });
+                }
             }
             return;
         }
 
         if (rank === '10') {
-            var ex10 = null;
-            for (var j = 0; j < G.players[playerIdx].effects.length; j++) {
-                var e10 = G.players[playerIdx].effects[j];
-                if (e10.rank === '10' && !e10.permanent) { ex10 = e10; break; }
-            }
-            if (ex10) { ex10.remainingCount = (ex10.remainingCount || 0) + count; }
-            else {
-                G.players[playerIdx].effects.push({
-                    rank: '10', name: '10', desc: def.desc,
-                    duration: 0, permanent: false, stacks: 1,
-                    boy: '', boyDuration: 0,
-                    isInstant: true, remainingCount: count
-                });
+            var targets10 = getTargets(playerIdx);
+            for (var t10 = 0; t10 < targets10.length; t10++) {
+                var tP10 = G.players[targets10[t10]];
+                var ex10 = null;
+                for (var j = 0; j < tP10.effects.length; j++) {
+                    var e10 = tP10.effects[j];
+                    if (e10.rank === '10' && !e10.permanent) { ex10 = e10; break; }
+                }
+                if (ex10) { ex10.remainingCount = (ex10.remainingCount || 0) + count; }
+                else {
+                    tP10.effects.push({
+                        rank: '10', name: '10', desc: def.desc,
+                        duration: 0, permanent: false, stacks: 1,
+                        boy: '', boyDuration: 0,
+                        isInstant: true, remainingCount: count
+                    });
+                }
             }
             return;
         }
@@ -250,6 +300,16 @@
                 });
             }
         }
+    }
+
+    // 7 结算：先读衣物数，自动 pop，剩余加到扩张
+    function settleSeven(playerIdx, count) {
+        var p = G.players[playerIdx];
+        var clothCount = p.clothes ? p.clothes.length : 0;
+        var toRemove = Math.min(clothCount, count);
+        for (var i = 0; i < toRemove; i++) p.clothes.pop();
+        var excess = count - toRemove;
+        if (excess > 0) handleExpandEffect(playerIdx, excess);
     }
 
     function handleExpandEffect(playerIdx, count) {
@@ -287,6 +347,7 @@
         addEffect(playerIdx, rank, actualCount);
     }
 
+    // 触发效果（合并版）
     function triggerEffects(playerIdx, cards) {
         if (!cards || cards.length === 0) return;
         if (cards.indexOf('小王') >= 0 && cards.indexOf('大王') >= 0 && cards.length === 2) {
@@ -299,6 +360,7 @@
         }
         var counts = {};
         for (var i = 0; i < cards.length; i++) counts[cards[i]] = (counts[cards[i]] || 0) + 1;
+        // 按触发顺序处理，但同 rank 一次调用
         for (var j = 0; j < TRIGGER_ORDER.length; j++) {
             var rank = TRIGGER_ORDER[j];
             if (!counts[rank]) continue;
@@ -306,16 +368,47 @@
         }
     }
 
+    // 火箭合并优化版
     function triggerRocket(playerIdx) {
         G.rocketCount++;
         G.multiplier += 2;
+        var batch = {};
         for (var i = 0; i < TRIGGER_ORDER.length; i++) {
             var rank = TRIGGER_ORDER[i];
             var actual = calcTriggerCount(playerIdx, 4);
-            addEffect(playerIdx, rank, actual);
+            if (rank === '10') {
+                // 10 特殊：跳过，最后单独处理
+                batch['__10__'] = (batch['__10__'] || 0) + actual;
+            } else if (rank === '7') {
+                batch['__7__'] = (batch['__7__'] || 0) + actual;
+            } else if (rank === '小王') {
+                batch['__xiaowang__'] = (batch['__xiaowang__'] || 0) + actual;
+            } else {
+                batch[rank] = (batch[rank] || 0) + actual;
+            }
         }
-        var sowCount = calcTriggerCount(playerIdx, 1);
-        addEffect(playerIdx, '小王', sowCount);
+        // 小王单独 1 次
+        var sowExtra = calcTriggerCount(playerIdx, 1);
+        batch['__xiaowang__'] = (batch['__xiaowang__'] || 0) + sowExtra;
+
+        // 普通牌一次性批量添加（不经过 applyRankEffect，因为火箭本身不延迟）
+        // 但需要走 hasSowLock 判断
+        var hasLock = hasSowLock(playerIdx);
+        for (var r in batch) {
+            if (r === '__10__') {
+                addEffect(playerIdx, '10', batch[r]);
+            } else if (r === '__7__') {
+                addEffect(playerIdx, '7', batch[r]);
+            } else if (r === '__xiaowang__') {
+                addEffect(playerIdx, '小王', batch[r]);
+            } else {
+                if (hasLock) {
+                    G.pendingEffects.push({ playerIdx: playerIdx, rank: r, count: batch[r] });
+                } else {
+                    addEffect(playerIdx, r, batch[r]);
+                }
+            }
+        }
     }
 
     function flushPendingEffects(playerIdx) {
@@ -382,6 +475,130 @@
         saveAll(); renderUI(); injectState();
     }
 
+    // ===== 牌型识别与比较 =====
+    function getCardType(cards) {
+        if (!cards || cards.length === 0) return { type: 'invalid' };
+        var n = cards.length;
+        var counts = {};
+        for (var i = 0; i < n; i++) counts[cards[i]] = (counts[cards[i]] || 0) + 1;
+        var ranks = Object.keys(counts);
+        var vals = ranks.map(function (r) { return counts[r]; });
+        var maxCount = Math.max.apply(null, vals);
+
+        if (n === 2 && counts['小王'] && counts['大王']) return { type: 'rocket', main: '大王' };
+        if (n === 1) return { type: 'single', main: cards[0], len: 1 };
+        if (n === 4 && maxCount === 4) return { type: 'bomb', main: ranks[0] };
+        if (n === 2 && maxCount === 2) return { type: 'pair', main: ranks[0], len: 2 };
+        if (n === 3 && maxCount === 3) return { type: 'triple', main: ranks[0], len: 3 };
+        if (n === 4 && maxCount === 3) return { type: 'triple1', main: ranks.filter(function(r){return counts[r]===3;})[0], len: 4 };
+        if (n === 5 && maxCount === 3) {
+            var hasPair = vals.indexOf(2) >= 0;
+            if (hasPair) return { type: 'triple2', main: ranks.filter(function(r){return counts[r]===3;})[0], len: 5 };
+        }
+        // 顺子
+        if (n >= 5 && maxCount === 1) {
+            if (isConsecutive(ranks)) return { type: 'straight', main: highest(ranks), len: n };
+        }
+        // 连对
+        if (n >= 6 && n % 2 === 0 && maxCount === 2 && ranks.length === n / 2) {
+            if (isConsecutive(ranks)) return { type: 'pairs', main: highest(ranks), len: n };
+        }
+        // 飞机
+        if (n >= 6 && n % 3 === 0) {
+            var triples = ranks.filter(function (r) { return counts[r] === 3; });
+            if (triples.length >= 2 && triples.length * 3 === n) {
+                if (isConsecutive(triples)) return { type: 'plane', main: highest(triples), len: n, mainLen: triples.length };
+            }
+        }
+        // 飞机带翅膀
+        if (n >= 8) {
+            var triples2 = ranks.filter(function (r) { return counts[r] >= 3; });
+            for (var tlen = triples2.length; tlen >= 2; tlen--) {
+                var combos = combinations(triples2, tlen);
+                for (var c = 0; c < combos.length; c++) {
+                    var trip = combos[c];
+                    if (!isConsecutive(trip)) continue;
+                    var used = {};
+                    trip.forEach(function (r) { used[r] = 3; });
+                    var restLen = n - tlen * 3;
+                    if (restLen === tlen || restLen === tlen * 2) {
+                        var restCards = [];
+                        for (var rr in counts) {
+                            var usedN = used[rr] || 0;
+                            for (var u = usedN; u < counts[rr]; u++) restCards.push(rr);
+                        }
+                        if (restLen === tlen && restCards.length === tlen) {
+                            return { type: 'planeWings', main: highest(trip), len: n, mainLen: tlen };
+                        }
+                        if (restLen === tlen * 2) {
+                            var restCounts = {};
+                            restCards.forEach(function (r) { restCounts[r] = (restCounts[r] || 0) + 1; });
+                            var allPairs = true;
+                            for (var rc in restCounts) if (restCounts[rc] !== 2) { allPairs = false; break; }
+                            if (allPairs) return { type: 'planeWings', main: highest(trip), len: n, mainLen: tlen };
+                        }
+                    }
+                }
+            }
+        }
+        // 四带二
+        if (n === 6 || n === 8) {
+            var fours = ranks.filter(function (r) { return counts[r] === 4; });
+            if (fours.length === 1) {
+                var rem = ranks.filter(function (r) { return r !== fours[0]; });
+                if (n === 6 && rem.length === 2) {
+                    if (counts[rem[0]] === 1 && counts[rem[1]] === 1) return { type: 'four2', main: fours[0], len: 6 };
+                }
+                if (n === 8 && rem.length === 2) {
+                    if (counts[rem[0]] === 2 && counts[rem[1]] === 2) return { type: 'four2pairs', main: fours[0], len: 8 };
+                }
+            }
+        }
+        return { type: 'invalid' };
+    }
+
+    function isConsecutive(ranks) {
+        if (ranks.indexOf('2') >= 0 || ranks.indexOf('小王') >= 0 || ranks.indexOf('大王') >= 0) return false;
+        var sorted = ranks.slice().sort(function (a, b) { return (SORT_KEY[a] || 99) - (SORT_KEY[b] || 99); });
+        for (var i = 1; i < sorted.length; i++) {
+            if ((SORT_KEY[sorted[i-1]] - SORT_KEY[sorted[i]]) !== 1) return false;
+        }
+        return true;
+    }
+
+    function highest(ranks) {
+        return ranks.slice().sort(function (a, b) { return (SORT_KEY[a] || 99) - (SORT_KEY[b] || 99); })[0];
+    }
+
+    function combinations(arr, k) {
+        if (k === 0) return [[]];
+        if (arr.length < k) return [];
+        var result = [];
+        for (var i = 0; i <= arr.length - k; i++) {
+            var rest = combinations(arr.slice(i + 1), k - 1);
+            for (var j = 0; j < rest.length; j++) result.push([arr[i]].concat(rest[j]));
+        }
+        return result;
+    }
+
+    function isPlayLegal(cards, lastPlayed) {
+        var t = getCardType(cards);
+        if (t.type === 'invalid') return false;
+        if (!lastPlayed) return true;
+        var lt = lastPlayed.type;
+        if (t.type === 'rocket') return true;
+        if (lt === 'rocket') return false;
+        if (t.type === 'bomb' && lt !== 'bomb') return true;
+        if (lt === 'bomb' && t.type !== 'bomb' && t.type !== 'rocket') return false;
+        if (t.type === 'bomb' && lt === 'bomb') {
+            return (SORT_KEY[t.main] || 99) < (SORT_KEY[lastPlayed.main] || 99);
+        }
+        if (t.type !== lt) return false;
+        if (t.len !== lastPlayed.len) return false;
+        return (SORT_KEY[t.main] || 99) < (SORT_KEY[lastPlayed.main] || 99);
+    }
+
+    // ===== 游戏流程 =====
     function startNewGame() {
         pushUndo();
         G = defaultState();
@@ -402,9 +619,9 @@
             var r = Math.floor(Math.random() * (s + 1));
             var tmp = deck[s]; deck[s] = deck[r]; deck[r] = tmp;
         }
-        G.players[0].hand = deck.slice(0, 17);
-        G.players[1].hand = deck.slice(17, 34);
-        G.players[2].hand = deck.slice(34, 51);
+        G.players[0].hand = sortHand(deck.slice(0, 17));
+        G.players[1].hand = sortHand(deck.slice(17, 34));
+        G.players[2].hand = sortHand(deck.slice(34, 51));
         G.bottomCards = deck.slice(51);
         G.phase = 'bid';
         G.currentTurn = G.bidStartIndex;
@@ -422,6 +639,7 @@
         G.rocketCount = 0;
         G.playPile = [];
         G.pendingEffects = [];
+        G.lastPlayed = null;
         saveAll(); renderUI(); injectState();
     }
 
@@ -530,6 +748,7 @@
         G.lastMotherIndex = G.motherIndex;
         var bottomCopy = G.bottomCards.slice();
         for (var j = 0; j < bottomCopy.length; j++) G.players[G.motherIndex].hand.push(bottomCopy[j]);
+        G.players[G.motherIndex].hand = sortHand(G.players[G.motherIndex].hand);
         G.bottomCards = [];
         triggerEffects(G.motherIndex, bottomCopy);
         G.phase = 'play';
@@ -550,6 +769,11 @@
         }
         p.hand = remaining;
         G.playPile.push({ player: p.name, cards: cards.join(' ') });
+
+        // 合法性判断
+        var legal = isPlayLegal(cards, G.lastPlayed);
+        var mult = legal ? 1 : 2;
+
         var counts = {};
         for (var j = 0; j < cards.length; j++) counts[cards[j]] = (counts[cards[j]] || 0) + 1;
         var isRocket = cards.length === 2 && cards.indexOf('小王') >= 0 && cards.indexOf('大王') >= 0;
@@ -560,7 +784,22 @@
                 G.multiplier += 2;
             }
         }
-        triggerEffects(playerIdx, cards);
+        // 触发效果（倍数乘数）
+        if (mult > 1) {
+            var doubled = [];
+            for (var dd = 0; dd < cards.length; dd++) {
+                doubled.push(cards[dd]);
+                doubled.push(cards[dd]);
+            }
+            triggerEffects(playerIdx, doubled);
+        } else {
+            triggerEffects(playerIdx, cards);
+        }
+
+        // 记录最后一手
+        var t = getCardType(cards);
+        G.lastPlayed = { playerIdx: playerIdx, cards: cards, type: t.type, main: t.main, len: t.len, legal: legal };
+
         if (p.hand.length === 0) { endRound(playerIdx); return; }
         G.hasActed[playerIdx] = true;
         advanceTurn((playerIdx + 1) % 3);
@@ -572,6 +811,31 @@
         G.playPile.push({ player: G.players[playerIdx].name, cards: '不出' });
         G.hasActed[playerIdx] = true;
         advanceTurn((playerIdx + 1) % 3);
+        saveAll(); renderUI(); injectState();
+    }
+
+    function doTimeout() {
+        var pIdx = G.currentTurn;
+        if (pIdx < 0 || pIdx > 2) { alert('当前无行动玩家'); return; }
+        pushUndo();
+        var p = G.players[pIdx];
+        // 触发该玩家所有手牌效果（排除6和大王）
+        var toTrigger = p.hand.filter(function (c) { return c !== '6' && c !== '大王'; });
+        if (toTrigger.length > 0) {
+            // 需要按目标玩家（婊子共享）触发
+            var counts = {};
+            for (var i = 0; i < toTrigger.length; i++) {
+                counts[toTrigger[i]] = (counts[toTrigger[i]] || 0) + 1;
+            }
+            for (var j = 0; j < TRIGGER_ORDER.length; j++) {
+                var rank = TRIGGER_ORDER[j];
+                if (!counts[rank]) continue;
+                applyRankEffect(pIdx, rank, counts[rank]);
+            }
+        }
+        G.playPile.push({ player: p.name, cards: '超时' });
+        G.hasActed[pIdx] = true;
+        advanceTurn((pIdx + 1) % 3);
         saveAll(); renderUI(); injectState();
     }
 
@@ -634,6 +898,7 @@
         G.bottomCards = [];
         G.pendingEffects = [];
         G.hasActed = [false, false, false];
+        G.lastPlayed = null;
         for (var i = 0; i < 3; i++) {
             G.players[i].hand = [];
             G.players[i].role = '';
@@ -670,6 +935,24 @@
         saveAll(); renderUI(); injectState();
     }
 
+    function editHand(playerIdx) {
+        var p = G.players[playerIdx];
+        var cur = p.hand.join('');
+        var input = prompt('输入该玩家手牌（格式如 34567 10JQKA 大小）：', cur);
+        if (input === null) return;
+        var cards = parseCards(input);
+        if (cards.length === 0) { alert('无法解析'); return; }
+        pushUndo();
+        p.hand = sortHand(cards);
+        saveAll(); renderUI(); injectState();
+    }
+
+    // ===== 状态注入 =====
+    function clothesText(p) {
+        if (!p.clothes || p.clothes.length === 0) return '全裸';
+        return '剩余 ' + p.clothes.length + ' 件';
+    }
+
     function buildStateText() {
         var txt = '【斗母猪当前状态】\n';
         txt += '阶段：' + phaseName(G.phase) + ' | 局数：' + G.roundNumber + ' | 倍数：' + G.multiplier + '\n';
@@ -678,8 +961,7 @@
             var p = G.players[i];
             txt += '【' + p.name + '】角色：' + (p.role || '未定') + ' | 分数：' + p.score + ' | 手牌数：' + p.hand.length + '\n';
             txt += '手牌：' + (p.hand.join(' ') || '无') + '\n';
-            var clothesText = (p.clothes && p.clothes.length > 0) ? p.clothes.join('、') : '（未填写）';
-            txt += '衣物：' + clothesText + '\n';
+            txt += '衣物：' + clothesText(p) + '\n';
             txt += '连续当母猪：' + G.consecutiveMother[i] + '\n';
             if (p.effects.length) {
                 txt += '效果：\n';
@@ -699,6 +981,9 @@
             }
             txt += '\n';
         }
+        if (G.lastPlayed) {
+            txt += '上一手：' + G.players[G.lastPlayed.playerIdx].name + ' 出 ' + G.lastPlayed.cards.join(' ') + (G.lastPlayed.legal ? '' : '（非法）') + '\n';
+        }
         if (G.playPile.length) {
             var recent = G.playPile.slice(-8).map(function (x) { return x.player + ':' + x.cards; }).join(' → ');
             txt += '出牌堆：' + recent + '\n';
@@ -708,7 +993,7 @@
 
     function injectState() {
         try {
-            var c = window.SillyTavern.getContext();
+            var c = getCtx();
             if (c && c.setExtensionPrompt) {
                 c.setExtensionPrompt(EXT_NAME, buildStateText(), 1, 0, false, 0);
             }
@@ -716,7 +1001,7 @@
         window.DouSowStateText = buildStateText();
     }
 
-    // 计算右下角坐标，用 left/top 显式赋值（避免 right/bottom 在某些环境下失效）
+    // ===== UI =====
     function placePanelBottomRight() {
         if (!panel) return;
         var w = window.innerWidth || document.documentElement.clientWidth || 400;
@@ -728,10 +1013,10 @@
         var top = h - ph - margin;
         if (left < margin) left = margin;
         if (top < margin) top = margin;
-        panel.style.left = left + 'px';
-        panel.style.top = top + 'px';
-        panel.style.right = 'auto';
-        panel.style.bottom = 'auto';
+        panel.style.setProperty('left', left + 'px', 'important');
+        panel.style.setProperty('top', top + 'px', 'important');
+        panel.style.setProperty('right', 'auto', 'important');
+        panel.style.setProperty('bottom', 'auto', 'important');
     }
 
     function createUI() {
@@ -740,37 +1025,25 @@
 
         panel = document.createElement('div');
         panel.id = 'dousow-panel';
-        panel.style.position = 'fixed';
-        // 先给一个左上角的兜底位置，稍后 JS 会重算到右下角
-        panel.style.left = '10px';
-        panel.style.top = '80px';
-        panel.style.right = 'auto';
-        panel.style.bottom = 'auto';
-        panel.style.width = '360px';
-        panel.style.maxHeight = '75vh';
-        panel.style.background = uiSettings.bgColor || '#4a0e0e';
-        panel.style.color = '#ffe0e8';
-        panel.style.border = '2px solid #8b1a3a';
-        panel.style.borderRadius = '12px';
-        panel.style.zIndex = '2147483647';
-        panel.style.fontSize = '12px';
-        panel.style.overflow = 'hidden';
-        panel.style.display = 'flex';
-        panel.style.flexDirection = 'column';
-        panel.style.boxShadow = '0 4px 24px rgba(139,26,58,0.6)';
-        panel.style.cursor = 'move';
+        panel.style.setProperty('position', 'fixed', 'important');
+        panel.style.setProperty('left', '10px', 'important');
+        panel.style.setProperty('top', '80px', 'important');
+        panel.style.setProperty('width', '360px', 'important');
+        panel.style.setProperty('max-height', '75vh', 'important');
+        panel.style.setProperty('background', uiSettings.bgColor || '#4a0e0e', 'important');
+        panel.style.setProperty('color', '#ffe0e8', 'important');
+        panel.style.setProperty('border', '2px solid #8b1a3a', 'important');
+        panel.style.setProperty('border-radius', '12px', 'important');
+        panel.style.setProperty('z-index', '2147483647', 'important');
+        panel.style.setProperty('font-size', '12px', 'important');
+        panel.style.setProperty('overflow', 'hidden', 'important');
+        panel.style.setProperty('display', 'flex', 'important');
+        panel.style.setProperty('flex-direction', 'column', 'important');
+        panel.style.setProperty('box-shadow', '0 4px 24px rgba(139,26,58,0.6)', 'important');
+        panel.style.setProperty('cursor', 'move', 'important');
 
         var head = document.createElement('div');
-        head.id = 'ds-head';
-        head.style.padding = '8px 12px';
-        head.style.background = '#8b1a3a';
-        head.style.color = '#fff';
-        head.style.fontWeight = 'bold';
-        head.style.borderRadius = '10px 10px 0 0';
-        head.style.userSelect = 'none';
-        head.style.display = 'flex';
-        head.style.justifyContent = 'space-between';
-        head.style.alignItems = 'center';
+        head.style.cssText = 'padding:8px 12px;background:linear-gradient(135deg,#8b1a3a,#c23a6a);color:#fff;font-weight:bold;border-radius:10px 10px 0 0;user-select:none;display:flex;justify-content:space-between;align-items:center;';
 
         var title = document.createElement('span');
         title.textContent = '🐷 斗母猪';
@@ -778,52 +1051,43 @@
 
         var btns = document.createElement('span');
 
-        var clothesBtn = document.createElement('button');
-        clothesBtn.textContent = '👗'; clothesBtn.title = '衣物管理';
-        btns.appendChild(clothesBtn);
+        function mkIconBtn(icon, title, handler) {
+            var b = document.createElement('button');
+            b.textContent = icon;
+            b.title = title;
+            b.style.cssText = 'background:#fff;color:#8b1a3a;border:none;border-radius:6px;padding:3px 8px;margin-left:3px;font-size:13px;font-weight:bold;cursor:pointer;';
+            b.onclick = handler;
+            return b;
+        }
 
-        var editBtn = document.createElement('button');
-        editBtn.textContent = '⚙'; editBtn.title = '效果编辑';
-        btns.appendChild(editBtn);
-
-        var bgBtn = document.createElement('button');
-        bgBtn.textContent = '🎨'; bgBtn.title = '换背景色';
-        btns.appendChild(bgBtn);
-
-        var minBtn = document.createElement('button');
-        minBtn.textContent = '—'; minBtn.title = '最小化';
-        btns.appendChild(minBtn);
-
-        var homeBtn = document.createElement('button');
-        homeBtn.textContent = '⌂'; homeBtn.title = '归位';
-        btns.appendChild(homeBtn);
+        btns.appendChild(mkIconBtn('⏱', '超时', doTimeout));
+        btns.appendChild(mkIconBtn('👗', '衣物', openClothesEditor));
+        btns.appendChild(mkIconBtn('⚙', '效果', openEffectEditor));
+        btns.appendChild(mkIconBtn('🎨', '背景', cycleBg));
+        btns.appendChild(mkIconBtn('⌂', '归位', function () {
+            userMovedPanel = false;
+            placePanelBottomRight();
+        }));
+        btns.appendChild(mkIconBtn('—', '最小化', function () {
+            var b = document.getElementById('ds-body');
+            b.style.display = (b.style.display === 'none') ? 'block' : 'none';
+        }));
 
         head.appendChild(btns);
         panel.appendChild(head);
 
         var body = document.createElement('div');
         body.id = 'ds-body';
-        body.style.padding = '8px';
-        body.style.overflowY = 'auto';
-        body.style.flex = '1';
-        body.style.cursor = 'auto';
+        body.style.cssText = 'padding:8px;overflow-y:auto;flex:1;cursor:auto;';
         panel.appendChild(body);
 
         document.body.appendChild(panel);
-
-        editBtn.onclick = openEffectEditor;
-        clothesBtn.onclick = openClothesEditor;
-        bgBtn.onclick = cycleBg;
-        minBtn.onclick = function () {
-            var b = document.getElementById('ds-body');
-            b.style.display = (b.style.display === 'none') ? 'block' : 'none';
-        };
-        homeBtn.onclick = placePanelBottomRight;
 
         panel.addEventListener('mousedown', function (e) {
             var tag = e.target.tagName;
             if (tag === 'BUTTON' || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
             isDragging = true;
+            userMovedPanel = true;
             var r = panel.getBoundingClientRect();
             dragOff.x = e.clientX - r.left;
             dragOff.y = e.clientY - r.top;
@@ -832,6 +1096,7 @@
             var tag = e.target.tagName;
             if (tag === 'BUTTON' || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
             isDragging = true;
+            userMovedPanel = true;
             var t = e.touches[0];
             var r = panel.getBoundingClientRect();
             dragOff.x = t.clientX - r.left;
@@ -839,38 +1104,45 @@
         }, { passive: true });
         document.addEventListener('mousemove', function (e) {
             if (!isDragging) return;
-            panel.style.left = (e.clientX - dragOff.x) + 'px';
-            panel.style.top = (e.clientY - dragOff.y) + 'px';
-            panel.style.right = 'auto';
-            panel.style.bottom = 'auto';
+            panel.style.setProperty('left', (e.clientX - dragOff.x) + 'px', 'important');
+            panel.style.setProperty('top', (e.clientY - dragOff.y) + 'px', 'important');
+            panel.style.setProperty('right', 'auto', 'important');
+            panel.style.setProperty('bottom', 'auto', 'important');
         });
         document.addEventListener('touchmove', function (e) {
             if (!isDragging) return;
             var t = e.touches[0];
-            panel.style.left = (t.clientX - dragOff.x) + 'px';
-            panel.style.top = (t.clientY - dragOff.y) + 'px';
-            panel.style.right = 'auto';
-            panel.style.bottom = 'auto';
+            panel.style.setProperty('left', (t.clientX - dragOff.x) + 'px', 'important');
+            panel.style.setProperty('top', (t.clientY - dragOff.y) + 'px', 'important');
+            panel.style.setProperty('right', 'auto', 'important');
+            panel.style.setProperty('bottom', 'auto', 'important');
         }, { passive: true });
         document.addEventListener('mouseup', function () { isDragging = false; });
         document.addEventListener('touchend', function () { isDragging = false; });
 
-        // 面板创建后延迟重算位置到右下角
-        setTimeout(placePanelBottomRight, 50);
-        setTimeout(placePanelBottomRight, 500);
+        // 多次尝试贴右下角（面板渲染完成后才能正确测量）
+        setTimeout(function () {
+            if (!userMovedPanel) placePanelBottomRight();
+        }, 50);
+        setTimeout(function () {
+            if (!userMovedPanel) placePanelBottomRight();
+        }, 300);
+        setTimeout(function () {
+            if (!userMovedPanel) placePanelBottomRight();
+        }, 1000);
 
-        // 窗口尺寸变化时重新贴右下角
         window.addEventListener('resize', function () {
-            if (!isDragging) placePanelBottomRight();
+            if (!userMovedPanel) placePanelBottomRight();
         });
 
         return panel;
     }
 
-    function mkBtn(text, fn) {
+    function styledBtn(text, fn, opts) {
+        opts = opts || {};
         var b = document.createElement('button');
         b.textContent = text;
-        b.style.margin = '2px';
+        b.style.cssText = 'background:' + (opts.bg || '#c23a6a') + ';color:#fff;border:none;border-radius:6px;padding:5px 10px;margin:2px;font-size:11px;cursor:pointer;';
         b.onclick = fn;
         return b;
     }
@@ -879,34 +1151,36 @@
         var colors = ['#4a0e0e','#2d0a2d','#0e2a4a','#4a2e0e','#1a0a0a','#3a1a2a','#2a0a0a'];
         var idx = colors.indexOf(uiSettings.bgColor);
         uiSettings.bgColor = colors[(idx + 1) % colors.length];
-        if (panel) panel.style.background = uiSettings.bgColor;
-        saveAll();
+        if (panel) panel.style.setProperty('background', uiSettings.bgColor, 'important');
+        saveAllDebounced();
     }
 
     function renderUI() {
+        if (renderTimer) return;
+        renderTimer = setTimeout(function () {
+            renderTimer = null;
+            doRenderUI();
+        }, 30);
+    }
+
+    function doRenderUI() {
         if (!panel) return;
         var body = document.getElementById('ds-body');
         if (!body || !G) return;
         body.innerHTML = '';
 
         var status = document.createElement('div');
-        status.style.padding = '6px';
-        status.style.background = 'rgba(255,51,102,0.15)';
-        status.style.borderRadius = '6px';
-        status.style.marginBottom = '6px';
+        status.style.cssText = 'padding:6px;background:rgba(255,51,102,0.2);border-radius:6px;margin-bottom:6px;';
         status.textContent = phaseName(G.phase) + ' | 局' + G.roundNumber + ' | 倍数×' + G.multiplier;
         body.appendChild(status);
 
         var row = document.createElement('div');
-        row.style.display = 'flex';
-        row.style.flexWrap = 'wrap';
-        row.style.gap = '4px';
-        row.style.marginBottom = '6px';
+        row.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px;';
 
-        row.appendChild(mkBtn('🎮 新游戏', startNewGame));
-        if (G.phase === 'deal') row.appendChild(mkBtn('🃏 发牌', doDeal));
-        if (G.phase === 'rest') row.appendChild(mkBtn('▶ 下一局', nextRound));
-        row.appendChild(mkBtn('↩ 撤回', doUndo));
+        row.appendChild(styledBtn('🎮 新游戏', startNewGame));
+        if (G.phase === 'deal') row.appendChild(styledBtn('🃏 发牌', doDeal));
+        if (G.phase === 'rest') row.appendChild(styledBtn('▶ 下一局', nextRound));
+        row.appendChild(styledBtn('↩ 撤回', doUndo));
         body.appendChild(row);
 
         for (var i = 0; i < 3; i++) {
@@ -914,15 +1188,10 @@
             var isCur = (i === G.currentTurn);
 
             var card = document.createElement('div');
-            card.style.marginBottom = '6px';
-            card.style.padding = '8px';
-            card.style.borderRadius = '8px';
-            card.style.background = 'rgba(139,26,58,0.15)';
-            card.style.borderLeft = '3px solid ' + (p.role === '母猪' ? '#ff3366' : '#c23a6a');
+            card.style.cssText = 'margin-bottom:6px;padding:8px;border-radius:8px;background:rgba(139,26,58,0.2);border-left:3px solid ' + (p.role === '母猪' ? '#ff3366' : '#c23a6a') + ';';
 
             var nameRow = document.createElement('div');
-            nameRow.style.fontWeight = 'bold';
-            nameRow.style.color = isCur ? '#ff66aa' : '#ffe0e8';
+            nameRow.style.cssText = 'font-weight:bold;color:' + (isCur ? '#ff88bb' : '#ffe0e8') + ';';
             nameRow.textContent = p.name + (p.role ? ' (' + p.role + ')' : '') + ' | ' + p.score + '分 | 手牌' + p.hand.length;
             card.appendChild(nameRow);
 
@@ -930,33 +1199,22 @@
             nameInput.type = 'text';
             nameInput.value = p.name;
             nameInput.setAttribute('data-name', i);
-            nameInput.style.width = '70px';
-            nameInput.style.background = '#2a1010';
-            nameInput.style.color = '#fff';
-            nameInput.style.border = '1px solid #666';
-            nameInput.style.marginTop = '2px';
+            nameInput.style.cssText = 'width:70px;background:#2a1010;color:#fff;border:1px solid #666;border-radius:4px;padding:2px 4px;margin-top:2px;font-size:11px;';
             card.appendChild(nameInput);
 
             var handDiv = document.createElement('div');
-            handDiv.style.fontSize = '10px';
-            handDiv.style.wordBreak = 'break-all';
-            handDiv.style.marginTop = '2px';
+            handDiv.style.cssText = 'font-size:10px;word-break:break-all;margin-top:2px;';
             handDiv.textContent = '手牌：' + (p.hand.join(' ') || '无');
             card.appendChild(handDiv);
 
             var clothesInfo = document.createElement('div');
-            clothesInfo.style.fontSize = '10px';
-            clothesInfo.style.marginTop = '2px';
-            clothesInfo.style.color = '#ffbbcc';
-            var clothesText = (p.clothes && p.clothes.length > 0) ? ('共' + p.clothes.length + '件：' + p.clothes.join('、')) : '无衣物';
-            clothesInfo.textContent = '衣物：' + clothesText;
+            clothesInfo.style.cssText = 'font-size:10px;margin-top:2px;color:#ffbbcc;';
+            clothesInfo.textContent = '衣物：' + clothesText(p);
             card.appendChild(clothesInfo);
 
             if (p.effects.length) {
                 var effDiv = document.createElement('div');
-                effDiv.style.fontSize = '10px';
-                effDiv.style.color = '#ff99bb';
-                effDiv.style.marginTop = '2px';
+                effDiv.style.cssText = 'font-size:10px;color:#ff99bb;margin-top:2px;';
                 for (var j = 0; j < p.effects.length; j++) {
                     var e = p.effects[j];
                     var dur;
@@ -971,61 +1229,56 @@
                 card.appendChild(effDiv);
             }
 
+            var btnRow = document.createElement('div');
+            btnRow.style.cssText = 'margin-top:4px;display:flex;flex-wrap:wrap;gap:2px;';
+
+            btnRow.appendChild(styledBtn('编辑手牌', (function (idx) { return function () { editHand(idx); }; })(i)));
+
             var has10 = false;
             for (var k = 0; k < p.effects.length; k++) {
                 if (p.effects[k].rank === '10' && p.effects[k].isInstant) { has10 = true; break; }
             }
             if (has10) {
-                var tenRow = document.createElement('div');
-                tenRow.style.marginTop = '4px';
-                tenRow.appendChild(mkBtn('10减1', (function (idx) { return function () { reduce10(idx); }; })(i)));
-                card.appendChild(tenRow);
+                btnRow.appendChild(styledBtn('10减1', (function (idx) { return function () { reduce10(idx); }; })(i)));
             }
 
             if (G.phase === 'deal') {
-                var r14Row = document.createElement('div');
-                r14Row.style.marginTop = '4px';
-                r14Row.appendChild(mkBtn('⚠ 未上桌（规则14）', (function (idx) { return function () { triggerRule14For(idx); }; })(i)));
-                card.appendChild(r14Row);
+                btnRow.appendChild(styledBtn('未上桌', (function (idx) { return function () { triggerRule14For(idx); }; })(i)));
             }
+            card.appendChild(btnRow);
 
             if (G.phase === 'bid' && i === G.currentTurn) {
                 var bidRow = document.createElement('div');
-                bidRow.style.marginTop = '4px';
-                bidRow.appendChild(mkBtn('不叫', (function (idx) { return function () { doBid(idx, '不叫'); }; })(i)));
-                bidRow.appendChild(mkBtn('1', (function (idx) { return function () { doBid(idx, '1'); }; })(i)));
-                bidRow.appendChild(mkBtn('2', (function (idx) { return function () { doBid(idx, '2'); }; })(i)));
-                bidRow.appendChild(mkBtn('3', (function (idx) { return function () { doBid(idx, '3'); }; })(i)));
+                bidRow.style.cssText = 'margin-top:4px;display:flex;flex-wrap:wrap;gap:2px;';
+                bidRow.appendChild(styledBtn('不叫', (function (idx) { return function () { doBid(idx, '不叫'); }; })(i)));
+                bidRow.appendChild(styledBtn('1', (function (idx) { return function () { doBid(idx, '1'); }; })(i)));
+                bidRow.appendChild(styledBtn('2', (function (idx) { return function () { doBid(idx, '2'); }; })(i)));
+                bidRow.appendChild(styledBtn('3', (function (idx) { return function () { doBid(idx, '3'); }; })(i)));
                 card.appendChild(bidRow);
             }
             if (G.phase === 'grab' && i === G.currentTurn) {
                 var grabRow = document.createElement('div');
-                grabRow.style.marginTop = '4px';
-                grabRow.appendChild(mkBtn('抢', (function (idx) { return function () { doGrab(idx, true); }; })(i)));
-                grabRow.appendChild(mkBtn('不抢', (function (idx) { return function () { doGrab(idx, false); }; })(i)));
+                grabRow.style.cssText = 'margin-top:4px;display:flex;gap:2px;';
+                grabRow.appendChild(styledBtn('抢', (function (idx) { return function () { doGrab(idx, true); }; })(i)));
+                grabRow.appendChild(styledBtn('不抢', (function (idx) { return function () { doGrab(idx, false); }; })(i)));
                 card.appendChild(grabRow);
             }
             if (G.phase === 'play') {
                 var playRow = document.createElement('div');
-                playRow.style.marginTop = '4px';
-                playRow.style.display = 'flex';
-                playRow.style.gap = '4px';
+                playRow.style.cssText = 'margin-top:4px;display:flex;gap:4px;';
                 var input = document.createElement('input');
                 input.type = 'text';
                 input.id = 'ds-play-' + i;
-                input.placeholder = '如34567 或10JQKA';
-                input.style.flex = '1';
-                input.style.background = '#2a1010';
-                input.style.color = '#fff';
-                input.style.border = '1px solid #666';
+                input.placeholder = '如34567';
+                input.style.cssText = 'flex:1;background:#2a1010;color:#fff;border:1px solid #666;border-radius:4px;padding:3px 6px;font-size:11px;min-width:0;';
                 playRow.appendChild(input);
-                playRow.appendChild(mkBtn('出', (function (idx) {
+                playRow.appendChild(styledBtn('出', (function (idx) {
                     return function () {
                         var inp = document.getElementById('ds-play-' + idx);
                         if (inp) doPlay(idx, inp.value);
                     };
                 })(i)));
-                playRow.appendChild(mkBtn('不出', (function (idx) { return function () { doPass(idx); }; })(i)));
+                playRow.appendChild(styledBtn('不出', (function (idx) { return function () { doPass(idx); }; })(i)));
                 card.appendChild(playRow);
             }
 
@@ -1034,22 +1287,20 @@
 
         if (G.phase === 'rest') {
             var secRow = document.createElement('div');
-            secRow.style.marginTop = '6px';
+            secRow.style.cssText = 'margin-top:6px;';
             secRow.textContent = '已过秒数：';
             var secInput = document.createElement('input');
             secInput.type = 'number';
             secInput.id = 'dousow-sec';
-            secInput.style.width = '70px';
+            secInput.style.cssText = 'width:70px;background:#2a1010;color:#fff;border:1px solid #666;border-radius:4px;padding:3px;';
             secRow.appendChild(secInput);
-            secRow.appendChild(mkBtn('确认', applySeconds));
+            secRow.appendChild(styledBtn('确认', applySeconds));
             body.appendChild(secRow);
         }
 
         if (G.playPile.length) {
             var pile = document.createElement('div');
-            pile.style.fontSize = '10px';
-            pile.style.color = '#ffccdd';
-            pile.style.marginTop = '4px';
+            pile.style.cssText = 'font-size:10px;color:#ffccdd;margin-top:4px;';
             var recent = G.playPile.slice(-6).map(function (x) { return x.player + ':' + x.cards; }).join(' → ');
             pile.textContent = '出牌堆：' + recent;
             body.appendChild(pile);
@@ -1061,7 +1312,7 @@
                 inp.onchange = function () {
                     var idx = parseInt(inp.getAttribute('data-name'));
                     G.players[idx].name = inp.value || PLAYER_NAMES[idx];
-                    saveAll(); injectState();
+                    saveAllDebounced(); injectState();
                 };
             })(nameInputs[n]);
         }
@@ -1073,72 +1324,29 @@
 
         var div = document.createElement('div');
         div.id = 'dousow-clothes';
-        div.style.position = 'fixed';
-        div.style.left = '5%';
-        div.style.top = '5%';
-        div.style.width = '90%';
-        div.style.maxWidth = '520px';
-        div.style.maxHeight = '85vh';
-        div.style.background = '#2a0a12';
-        div.style.color = '#ffe0e8';
-        div.style.padding = '14px';
-        div.style.borderRadius = '12px';
-        div.style.zIndex = '2147483646';
-        div.style.overflow = 'auto';
-        div.style.border = '2px solid #8b1a3a';
-        div.style.fontSize = '12px';
+        div.style.cssText = 'position:fixed;left:5%;top:5%;width:90%;max-width:520px;max-height:85vh;background:#2a0a12;color:#ffe0e8;padding:14px;border-radius:12px;z-index:2147483646;overflow:auto;border:2px solid #8b1a3a;font-size:12px;';
 
         var headerRow = document.createElement('div');
-        headerRow.style.display = 'flex';
-        headerRow.style.justifyContent = 'space-between';
-        headerRow.style.alignItems = 'center';
-        headerRow.style.marginBottom = '8px';
+        headerRow.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;';
 
         var h = document.createElement('h3');
-        h.style.margin = '0';
-        h.style.color = '#ff88aa';
+        h.style.cssText = 'margin:0;color:#ff88aa;';
         h.textContent = '👗 衣物管理';
         headerRow.appendChild(h);
 
         var rightBtns = document.createElement('span');
-
-        var resetBtn = document.createElement('button');
-        resetBtn.textContent = '↻ 恢复默认';
-        resetBtn.style.padding = '6px 10px';
-        resetBtn.style.background = '#8b1a3a';
-        resetBtn.style.color = '#fff';
-        resetBtn.style.border = 'none';
-        resetBtn.style.borderRadius = '6px';
-        resetBtn.style.cursor = 'pointer';
-        resetBtn.style.marginRight = '4px';
-        resetBtn.onclick = function () {
-            if (!confirm('确定恢复三人的衣物为默认列表？当前修改会丢失。')) return;
-            for (var i = 0; i < 3; i++) {
-                G.players[i].clothes = DEFAULT_CLOTHES[i].slice();
-            }
-            saveAll(); injectState(); renderUI(); renderList();
-        };
-        rightBtns.appendChild(resetBtn);
-
-        var closeBtn = document.createElement('button');
-        closeBtn.textContent = '✕ 关闭';
-        closeBtn.style.padding = '6px 12px';
-        closeBtn.style.background = '#8b1a3a';
-        closeBtn.style.color = '#fff';
-        closeBtn.style.border = 'none';
-        closeBtn.style.borderRadius = '6px';
-        closeBtn.style.cursor = 'pointer';
-        closeBtn.onclick = function () { div.remove(); };
-        rightBtns.appendChild(closeBtn);
-
+        rightBtns.appendChild(styledBtn('↻ 恢复默认', function () {
+            if (!confirm('确定恢复默认衣物？当前修改会丢失。')) return;
+            for (var i = 0; i < 3; i++) G.players[i].clothes = DEFAULT_CLOTHES[i].slice();
+            saveAll(); renderUI(); injectState(); renderList();
+        }));
+        rightBtns.appendChild(styledBtn('✕ 关闭', function () { div.remove(); }));
         headerRow.appendChild(rightBtns);
         div.appendChild(headerRow);
 
         var hint = document.createElement('div');
-        hint.style.fontSize = '10px';
-        hint.style.color = '#ffaabb';
-        hint.style.marginBottom = '8px';
-        hint.textContent = '每件衣物单独一行。触发7时自动移除最后一件（列表末位）。';
+        hint.style.cssText = 'font-size:10px;color:#ffaabb;margin-bottom:8px;';
+        hint.textContent = '每件衣物单独一行。7 触发时自动移除末位衣物。';
         div.appendChild(hint);
 
         function renderList() {
@@ -1147,12 +1355,11 @@
             for (var i = 0; i < 3; i++) {
                 var p = G.players[i];
                 var block = document.createElement('div');
-                block.style.borderTop = '1px solid #5a1a2a';
-                block.style.padding = '8px 0';
+                block.style.cssText = 'border-top:1px solid #5a1a2a;padding:8px 0;';
 
                 var nameLabel = document.createElement('b');
                 nameLabel.style.color = '#ff99bb';
-                nameLabel.textContent = p.name + (p.role ? ' (' + p.role + ')' : '');
+                nameLabel.textContent = p.name + (p.role ? ' (' + p.role + ')' : '') + ' — 剩余 ' + p.clothes.length + ' 件';
                 block.appendChild(nameLabel);
 
                 var listDiv = document.createElement('div');
@@ -1160,77 +1367,46 @@
 
                 if (p.clothes.length === 0) {
                     var empty = document.createElement('div');
-                    empty.style.fontSize = '11px';
-                    empty.style.color = '#888';
+                    empty.style.cssText = 'font-size:11px;color:#888;';
                     empty.textContent = '（无衣物）';
                     listDiv.appendChild(empty);
                 } else {
                     for (var j = 0; j < p.clothes.length; j++) {
                         (function (playerIdx, itemIdx) {
-                            var row = document.createElement('div');
-                            row.style.display = 'flex';
-                            row.style.alignItems = 'center';
-                            row.style.marginBottom = '3px';
-                            row.style.gap = '4px';
+                            var rw = document.createElement('div');
+                            rw.style.cssText = 'display:flex;align-items:center;margin-bottom:3px;gap:4px;';
 
                             var idxSpan = document.createElement('span');
-                            idxSpan.style.color = '#ffaabb';
-                            idxSpan.style.minWidth = '20px';
+                            idxSpan.style.cssText = 'color:#ffaabb;min-width:20px;';
                             idxSpan.textContent = '#' + (itemIdx + 1);
-                            row.appendChild(idxSpan);
+                            rw.appendChild(idxSpan);
 
                             var itemInput = document.createElement('input');
                             itemInput.type = 'text';
                             itemInput.value = G.players[playerIdx].clothes[itemIdx];
-                            itemInput.style.flex = '1';
-                            itemInput.style.background = '#1a0508';
-                            itemInput.style.color = '#ffe0e8';
-                            itemInput.style.border = '1px solid #c23a6a';
-                            itemInput.style.borderRadius = '4px';
-                            itemInput.style.padding = '3px 6px';
+                            itemInput.style.cssText = 'flex:1;background:#1a0508;color:#ffe0e8;border:1px solid #c23a6a;border-radius:4px;padding:3px 6px;';
                             itemInput.onchange = function () {
                                 G.players[playerIdx].clothes[itemIdx] = itemInput.value;
-                                saveAll(); injectState(); renderUI();
+                                saveAllDebounced(); injectState(); renderUI();
                             };
-                            row.appendChild(itemInput);
+                            rw.appendChild(itemInput);
 
-                            var delBtn = document.createElement('button');
-                            delBtn.textContent = '×';
-                            delBtn.style.background = '#5a0a1a';
-                            delBtn.style.color = '#fff';
-                            delBtn.style.border = 'none';
-                            delBtn.style.borderRadius = '4px';
-                            delBtn.style.padding = '3px 8px';
-                            delBtn.style.cursor = 'pointer';
-                            delBtn.onclick = function () {
+                            rw.appendChild(styledBtn('×', function () {
                                 G.players[playerIdx].clothes.splice(itemIdx, 1);
                                 saveAll(); injectState(); renderUI(); renderList();
-                            };
-                            row.appendChild(delBtn);
-
-                            listDiv.appendChild(row);
+                            }, { bg: '#5a0a1a' }));
+                            listDiv.appendChild(rw);
                         })(i, j);
                     }
                 }
                 block.appendChild(listDiv);
 
-                var addBtn = document.createElement('button');
-                addBtn.textContent = '+ 添加衣物';
-                addBtn.style.marginTop = '4px';
-                addBtn.style.background = '#8b1a3a';
-                addBtn.style.color = '#fff';
-                addBtn.style.border = 'none';
-                addBtn.style.borderRadius = '6px';
-                addBtn.style.padding = '4px 10px';
-                addBtn.style.cursor = 'pointer';
-                addBtn.onclick = (function (playerIdx) {
+                block.appendChild(styledBtn('+ 添加衣物', (function (playerIdx) {
                     return function () {
                         G.players[playerIdx].clothes.push('新衣物');
                         saveAll(); injectState(); renderUI(); renderList();
                     };
-                })(i);
-                block.appendChild(addBtn);
-
+                })(i)));
                 listContainer.appendChild(block);
             }
         }
@@ -1249,49 +1425,21 @@
 
         var div = document.createElement('div');
         div.id = 'dousow-editor';
-        div.style.position = 'fixed';
-        div.style.left = '5%';
-        div.style.top = '5%';
-        div.style.width = '90%';
-        div.style.maxWidth = '520px';
-        div.style.maxHeight = '85vh';
-        div.style.background = '#2a0a12';
-        div.style.color = '#ffe0e8';
-        div.style.padding = '14px';
-        div.style.borderRadius = '12px';
-        div.style.zIndex = '2147483646';
-        div.style.overflow = 'auto';
-        div.style.border = '2px solid #8b1a3a';
-        div.style.fontSize = '12px';
+        div.style.cssText = 'position:fixed;left:5%;top:5%;width:90%;max-width:520px;max-height:85vh;background:#2a0a12;color:#ffe0e8;padding:14px;border-radius:12px;z-index:2147483646;overflow:auto;border:2px solid #8b1a3a;font-size:12px;';
 
         var headerRow = document.createElement('div');
-        headerRow.style.display = 'flex';
-        headerRow.style.justifyContent = 'space-between';
-        headerRow.style.alignItems = 'center';
-        headerRow.style.marginBottom = '8px';
+        headerRow.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;';
 
         var h = document.createElement('h3');
-        h.style.margin = '0';
-        h.style.color = '#ff88aa';
+        h.style.cssText = 'margin:0;color:#ff88aa;';
         h.textContent = '⚙ 效果编辑器';
         headerRow.appendChild(h);
 
-        var closeBtn = document.createElement('button');
-        closeBtn.textContent = '✕ 关闭';
-        closeBtn.style.padding = '6px 12px';
-        closeBtn.style.background = '#8b1a3a';
-        closeBtn.style.color = '#fff';
-        closeBtn.style.border = 'none';
-        closeBtn.style.borderRadius = '6px';
-        closeBtn.style.cursor = 'pointer';
-        closeBtn.onclick = function () { div.remove(); };
-        headerRow.appendChild(closeBtn);
+        headerRow.appendChild(styledBtn('✕ 关闭', function () { div.remove(); }));
         div.appendChild(headerRow);
 
         var hint = document.createElement('div');
-        hint.style.fontSize = '10px';
-        hint.style.color = '#ffaabb';
-        hint.style.marginBottom = '8px';
+        hint.style.cssText = 'font-size:10px;color:#ffaabb;margin-bottom:8px;';
         hint.textContent = '修改后点保存立即生效。锁定的卡不可编辑。';
         div.appendChild(hint);
 
@@ -1302,43 +1450,30 @@
             var locked = e.locked;
 
             var block = document.createElement('div');
-            block.style.borderTop = '1px solid #5a1a2a';
-            block.style.padding = '6px 0';
+            block.style.cssText = 'border-top:1px solid #5a1a2a;padding:6px 0;';
 
             var label = document.createElement('b');
-            label.style.color = '#ff99bb';
+            label.style.cssText = 'color:#ff99bb;';
             label.textContent = r + (locked ? ' (锁定)' : '');
             block.appendChild(label);
 
-            var descDiv = document.createElement('div');
-            descDiv.style.marginTop = '3px';
-            descDiv.textContent = '描述：';
             var descArea = document.createElement('textarea');
             descArea.setAttribute('data-k', r);
             descArea.setAttribute('data-f', 'desc');
-            descArea.style.width = '100%';
-            descArea.style.height = '40px';
-            descArea.style.background = '#1a0508';
-            descArea.style.color = '#ffe0e8';
-            descArea.style.border = '1px solid #c23a6a';
-            descArea.style.borderRadius = '4px';
+            descArea.style.cssText = 'width:100%;height:40px;background:#1a0508;color:#ffe0e8;border:1px solid #c23a6a;border-radius:4px;margin-top:3px;font-size:11px;';
             descArea.value = e.desc || '';
             if (locked) descArea.readOnly = true;
-            descDiv.appendChild(descArea);
-            block.appendChild(descDiv);
+            block.appendChild(descArea);
 
             var durDiv = document.createElement('div');
-            durDiv.style.marginTop = '3px';
+            durDiv.style.cssText = 'margin-top:3px;';
             durDiv.textContent = '单次轮数：';
             var durInput = document.createElement('input');
             durInput.type = 'number';
             durInput.setAttribute('data-k', r);
             durInput.setAttribute('data-f', 'duration');
             durInput.value = (e.duration != null ? e.duration : 1);
-            durInput.style.width = '50px';
-            durInput.style.background = '#1a0508';
-            durInput.style.color = '#ffe0e8';
-            durInput.style.border = '1px solid #c23a6a';
+            durInput.style.cssText = 'width:50px;background:#1a0508;color:#ffe0e8;border:1px solid #c23a6a;border-radius:4px;';
             if (locked) durInput.disabled = true;
             durDiv.appendChild(durInput);
 
@@ -1353,19 +1488,14 @@
             block.appendChild(durDiv);
 
             var boyDiv = document.createElement('div');
-            boyDiv.style.marginTop = '3px';
+            boyDiv.style.cssText = 'margin-top:3px;';
             boyDiv.textContent = '男孩效果：';
             var boyInput = document.createElement('input');
             boyInput.type = 'text';
             boyInput.setAttribute('data-k', r);
             boyInput.setAttribute('data-f', 'boy');
             boyInput.value = e.boy || '';
-            boyInput.style.width = '70%';
-            boyInput.style.background = '#1a0508';
-            boyInput.style.color = '#ffe0e8';
-            boyInput.style.border = '1px solid #c23a6a';
-            boyInput.style.borderRadius = '4px';
-            boyInput.style.padding = '3px 6px';
+            boyInput.style.cssText = 'width:70%;background:#1a0508;color:#ffe0e8;border:1px solid #c23a6a;border-radius:4px;padding:3px 6px;';
             if (locked) boyInput.readOnly = true;
             boyDiv.appendChild(boyInput);
             block.appendChild(boyDiv);
@@ -1375,9 +1505,9 @@
 
         var btnRow = document.createElement('div');
         btnRow.style.marginTop = '10px';
-        btnRow.appendChild(mkBtn('保存全部', saveEffects));
-        btnRow.appendChild(mkBtn('导出JSON', exportEffects));
-        btnRow.appendChild(mkBtn('导入JSON', importEffects));
+        btnRow.appendChild(styledBtn('保存全部', saveEffects));
+        btnRow.appendChild(styledBtn('导出JSON', exportEffects));
+        btnRow.appendChild(styledBtn('导入JSON', importEffects));
         div.appendChild(btnRow);
 
         var fileInput = document.createElement('input');
@@ -1435,7 +1565,7 @@
 
     function setupEvents() {
         try {
-            var c = window.SillyTavern.getContext();
+            var c = getCtx();
             if (!c || !c.eventSource || !c.eventTypes) return;
             c.eventSource.on(c.eventTypes.GENERATION_STARTED, function () {
                 if (G && G.phase !== 'idle') injectState();
@@ -1451,18 +1581,14 @@
             doGrab: doGrab,
             doPlay: doPlay,
             doPass: doPass,
+            doTimeout: doTimeout,
             doUndo: doUndo,
             nextRound: nextRound,
             applySeconds: applySeconds,
             reduce10: reduce10,
+            editHand: editHand,
             openEffectEditor: openEffectEditor,
             openClothesEditor: openClothesEditor,
-            resetClothes: function () {
-                for (var i = 0; i < 3; i++) {
-                    G.players[i].clothes = DEFAULT_CLOTHES[i].slice();
-                }
-                saveAll(); renderUI(); injectState();
-            },
             placeBottomRight: placePanelBottomRight,
             getState: function () { return G; },
             getStateText: buildStateText
@@ -1472,11 +1598,11 @@
     function init() {
         loadAll();
         createUI();
-        renderUI();
+        doRenderUI();
         injectState();
         setupEvents();
         exposeAPI();
-        console.log('[DouSow] 插件已加载 v6');
+        console.log('[DouSow] 插件已加载 v7');
     }
 
     if (document.readyState === 'loading') {
