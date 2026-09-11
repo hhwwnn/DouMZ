@@ -1,11 +1,11 @@
-// DouMZ.js - 斗母猪 SillyTavern 扩展（完整版 v9）
+// DouMZ.js - 斗母猪 SillyTavern 扩展（完整版 v10）
 (function () {
     'use strict';
 
     const EXT_NAME = 'DouSow';
-    const STORAGE_KEY = 'dousow_state_v12';
-    const EFFECT_KEY = 'dousow_effects_v12';
-    const UI_KEY = 'dousow_ui_v12';
+    const STORAGE_KEY = 'dousow_state_v13';
+    const EFFECT_KEY = 'dousow_effects_v13';
+    const UI_KEY = 'dousow_ui_v13';
     const PLAYER_NAMES = ['塞拉', '诺亚', '薇拉'];
     const TRIGGER_ORDER = ['3','8','4','5','6','7','10','A','2','J','Q','K','小王','9'];
     const RANK_VALUE = { '3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'10':10,'J':13,'Q':14,'K':15,'A':11,'2':12,'小王':16,'大王':17 };
@@ -258,8 +258,6 @@
         return [playerIdx];
     }
 
-    // ===== 效果核心 =====
-    // forcePermanent=true 时，主效果永久，男孩部分 +1 轮
     function addEffect(playerIdx, rank, count, forcePermanent) {
         var def = getEffectDef(rank);
         if (!def) return;
@@ -318,23 +316,19 @@
         for (var t = 0; t < targets.length; t++) {
             var ti = targets[t];
             var target = G.players[ti];
-            // 匹配同 rank 且同 permanent 状态的效果
             var existingE = null;
             for (var k = 0; k < target.effects.length; k++) {
                 var ee = target.effects[k];
                 if (ee.rank === rank && ee.permanent === isPermanent) { existingE = ee; break; }
             }
             if (existingE) {
-                // 已存在同状态效果：叠加强度或时长
                 if (def.stackIntensity) existingE.stacks = (existingE.stacks || 1) + count;
                 if (!isPermanent) existingE.duration += def.duration * count;
-                // 男孩部分
                 if (def.boy) {
                     if (isPermanent) existingE.boyDuration = (existingE.boyDuration || 0) + 1;
                     else existingE.boyDuration = (existingE.boyDuration || 0) + def.duration * count;
                 }
             } else {
-                // 新建效果
                 target.effects.push({
                     rank: rank, name: def.name, desc: def.desc,
                     duration: isPermanent ? 0 : def.duration * count,
@@ -347,7 +341,6 @@
         }
     }
 
-    // 7 结算：读剩余衣物，累加 pendingStrip，剩余加到扩张
     function settleSeven(playerIdx, count) {
         var p = G.players[playerIdx];
         var available = Math.max(0, (p.clothes.length || 0) - (p.pendingStrip || 0));
@@ -357,7 +350,6 @@
         if (excess > 0) handleExpandEffect(playerIdx, excess);
     }
 
-    // 7 扩张：stacks 上限 6，超出加 duration
     function handleExpandEffect(playerIdx, count) {
         var p = G.players[playerIdx];
         var existing = null;
@@ -417,7 +409,6 @@
         }
     }
 
-    // 王炸：3/5/8 变永久，其他正常；所有效果都不延迟
     function triggerRocket(playerIdx) {
         G.rocketCount++;
         G.multiplier += 2;
@@ -426,13 +417,11 @@
             var rank = TRIGGER_ORDER[i];
             var actual = calcTriggerCount(playerIdx, 4);
             if (permanentRanks[rank]) {
-                // 3/5/8 变永久（独立条目，不影响已有非永久）
                 addEffect(playerIdx, rank, actual, true);
             } else {
                 addEffect(playerIdx, rank, actual);
             }
         }
-        // 小王 1 次
         var sowExtra = calcTriggerCount(playerIdx, 1);
         addEffect(playerIdx, '小王', sowExtra);
     }
@@ -499,7 +488,6 @@
         saveNow(); renderUI(); injectState();
     }
 
-    // ===== 牌型识别 =====
     function getCardType(cards) {
         if (!cards || cards.length === 0) return { type: 'invalid' };
         var n = cards.length;
@@ -618,7 +606,6 @@
         return (SORT_KEY[t.main] || 99) < (SORT_KEY[lastPlayed.main] || 99);
     }
 
-    // ===== 流程 =====
     function startNewGame() {
         pushUndo();
         G = defaultState();
@@ -822,7 +809,7 @@
 
         var t = getCardType(cards);
         G.lastPlayed = { playerIdx: playerIdx, cards: cards, type: t.type, main: t.main, len: t.len, legal: legal };
-        G.passCount = 0; // 有人出牌，重置 pass
+        G.passCount = 0;
 
         if (p.hand.length === 0) { endRound(playerIdx); return; }
         G.hasActed[playerIdx] = true;
@@ -837,7 +824,6 @@
         if (G.playPile.length > MAX_PILE) G.playPile = G.playPile.slice(-MAX_PILE);
         G.hasActed[playerIdx] = true;
         G.passCount++;
-        // 两人都过（连续两次不出），自由出牌
         if (G.passCount >= 2 && G.lastPlayed) {
             G.lastPlayed = null;
             G.passCount = 0;
@@ -847,7 +833,6 @@
         saveNow(); renderUI(); injectState();
     }
 
-    // 超时：触发该玩家所有手牌效果（不排除任何牌），遵从婊子共享
     function doTimeout() {
         var pIdx = G.currentTurn;
         if (pIdx < 0 || pIdx > 2) { alert('当前无行动玩家'); return; }
@@ -910,7 +895,6 @@
             }
             pl.score -= extra;
         }
-        // 7 扩张每局结束：stacks -1 且 duration -1，任一归零消失
         for (var q = 0; q < 3; q++) {
             var pp = G.players[q];
             var newEff = [];
@@ -920,14 +904,12 @@
                     eff.stacks = (eff.stacks || 1) - 1;
                     eff.duration = (eff.duration || 1) - 1;
                     if (eff.stacks > 0 && eff.duration > 0) newEff.push(eff);
-                    // 否则丢弃
                 } else {
                     newEff.push(eff);
                 }
             }
             pp.effects = newEff;
         }
-        // 进中场：轮→秒（1轮 = 180秒）
         for (var r = 0; r < 3; r++) {
             var ppp = G.players[r];
             for (var t = 0; t < ppp.effects.length; t++) {
@@ -955,7 +937,6 @@
         G.hasActed = [false, false, false];
         G.passCount = 0;
         G.lastPlayed = null;
-        // 出中场：秒→轮（每 60 秒 = 1 轮，向上取整）
         for (var i = 0; i < 3; i++) {
             var p = G.players[i];
             for (var j = 0; j < p.effects.length; j++) {
@@ -1006,10 +987,9 @@
         saveNow(); renderUI(); injectState();
     }
 
-    // 编辑手牌：预填用空格分隔（修复多小王）
     function editHand(playerIdx) {
         var p = G.players[playerIdx];
-        var cur = p.hand.join(' ');   // ← 空格分隔
+        var cur = p.hand.join(' ');
         var input = prompt('输入该玩家手牌（格式如 34567 10JQKA 大小）：', cur);
         if (input === null) return;
         var cards = parseCards(input);
@@ -1020,7 +1000,6 @@
         saveNow(); renderUI(); injectState();
     }
 
-    // ===== 状态注入 =====
     function clothesText(p) {
         if (!p.clothes || p.clothes.length === 0) return '全裸';
         var pending = p.pendingStrip || 0;
@@ -1073,15 +1052,15 @@
         return txt;
     }
 
+    // 关键修复：position 用 0（IN_PROMPT，AI 看到但不显示在聊天里）
     function injectState() {
         try {
             var c = getCtx();
-            if (c && c.setExtensionPrompt) c.setExtensionPrompt(EXT_NAME, buildStateText(), 1, 0, false, 0);
+            if (c && c.setExtensionPrompt) c.setExtensionPrompt(EXT_NAME, buildStateText(), 0, 0, false, 0);
         } catch (e) {}
         window.DouSowStateText = buildStateText();
     }
 
-    // ===== UI =====
     function placePanelBottomRight() {
         if (!panel) return;
         var w = window.innerWidth || document.documentElement.clientWidth || 400;
@@ -1214,7 +1193,6 @@
         renderTimer = setTimeout(function () { renderTimer = null; doRenderUI(); }, 30);
     }
 
-    // 效果行：主效果 + 男孩合并
     function effectLine(e) {
         var dur;
         if (e.permanent) dur = '永久';
@@ -1360,7 +1338,6 @@
         }
     }
 
-    // ===== 衣物编辑器：脱衣撤回 =====
     function openClothesEditor() {
         var exist = document.getElementById('dousow-clothes');
         if (exist) exist.remove();
@@ -1429,7 +1406,6 @@
                                 saveLazy(); injectState(); renderUI();
                             };
                             rw.appendChild(itemInput);
-                            // "脱"按钮：推入撤回栈，pendingStrip -1
                             rw.appendChild(styledBtn('脱', function () {
                                 pushUndo();
                                 G.players[playerIdx].clothes.splice(itemIdx, 1);
@@ -1618,7 +1594,7 @@
         injectState();
         setupEvents();
         exposeAPI();
-        console.log('[DouSow] 插件已加载 v9');
+        console.log('[DouSow] 插件已加载 v10');
     }
 
     if (document.readyState === 'loading') {
