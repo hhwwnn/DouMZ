@@ -1,11 +1,11 @@
-// DouMZ.js - 斗母猪 SillyTavern 扩展（完整版 v10）
+// DouMZ.js - 斗母猪 SillyTavern 扩展（完整版 v11）
 (function () {
     'use strict';
 
     const EXT_NAME = 'DouSow';
-    const STORAGE_KEY = 'dousow_state_v13';
-    const EFFECT_KEY = 'dousow_effects_v13';
-    const UI_KEY = 'dousow_ui_v13';
+    const STORAGE_KEY = 'dousow_state_v14';
+    const EFFECT_KEY = 'dousow_effects_v14';
+    const UI_KEY = 'dousow_ui_v14';
     const PLAYER_NAMES = ['塞拉', '诺亚', '薇拉'];
     const TRIGGER_ORDER = ['3','8','4','5','6','7','10','A','2','J','Q','K','小王','9'];
     const RANK_VALUE = { '3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'10':10,'J':13,'Q':14,'K':15,'A':11,'2':12,'小王':16,'大王':17 };
@@ -766,6 +766,7 @@
         G.currentTurn = G.motherIndex;
         G.hasActed = [false, false, false];
         G.passCount = 0;
+        invalidateCache();
     }
 
     function doPlay(playerIdx, inputStr) {
@@ -1014,6 +1015,9 @@
         var txt = '【斗母猪当前状态】\n';
         txt += '阶段：' + phaseName(G.phase) + ' | 局数：' + G.roundNumber + ' | 倍数：' + G.multiplier + '\n';
         txt += '当前行动：' + (G.players[G.currentTurn] ? G.players[G.currentTurn].name : '无') + '\n\n';
+        if (G.bottomCards && G.bottomCards.length > 0) {
+            txt += '底牌（未公开，不可看）：' + G.bottomCards.join(' ') + '\n\n';
+        }
         for (var i = 0; i < 3; i++) {
             var p = G.players[i];
             txt += '【' + p.name + '】角色：' + (p.role || '未定') + ' | 分数：' + p.score + ' | 手牌数：' + p.hand.length + '\n';
@@ -1052,7 +1056,6 @@
         return txt;
     }
 
-    // 关键修复：position 用 0（IN_PROMPT，AI 看到但不显示在聊天里）
     function injectState() {
         try {
             var c = getCtx();
@@ -1214,6 +1217,13 @@
         status.style.cssText = 'padding:6px;background:rgba(255,51,102,0.2);border-radius:6px;margin-bottom:6px;';
         status.textContent = phaseName(G.phase) + ' | 局' + G.roundNumber + ' | 倍数×' + G.multiplier;
         body.appendChild(status);
+
+        if (G.bottomCards && G.bottomCards.length > 0) {
+            var bottomInfo = document.createElement('div');
+            bottomInfo.style.cssText = 'padding:4px 6px;background:rgba(200,150,50,0.25);border-radius:6px;margin-bottom:6px;font-size:11px;color:#ffddaa;';
+            bottomInfo.textContent = '底牌（未公开）：' + G.bottomCards.join(' ');
+            body.appendChild(bottomInfo);
+        }
 
         var row = document.createElement('div');
         row.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px;';
@@ -1594,7 +1604,7 @@
         injectState();
         setupEvents();
         exposeAPI();
-        console.log('[DouSow] 插件已加载 v10');
+        console.log('[DouSow] 插件已加载 v11');
     }
 
     if (document.readyState === 'loading') {
